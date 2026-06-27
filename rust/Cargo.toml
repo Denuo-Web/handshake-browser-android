@@ -1,0 +1,56 @@
+[workspace]
+resolver = "3"
+exclude = ["fuzz"]
+members = [
+    "crates/android-ffi",
+    "crates/hns-cache",
+    "crates/hns-chain",
+    "crates/hns-core",
+    "crates/hns-dane",
+    "crates/hns-dnssec",
+    "crates/hns-gateway",
+    "crates/hns-p2p",
+    "crates/hns-resolver",
+    "crates/hns-sync",
+    "crates/hns-transport",
+    "crates/hns-urkel",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+rust-version = "1.92"
+
+[workspace.dependencies]
+blake2 = "0.10"
+hex = "0.4"
+hns-cache = { path = "crates/hns-cache" }
+hns-chain = { path = "crates/hns-chain" }
+hns-core = { path = "crates/hns-core" }
+hns-dane = { path = "crates/hns-dane" }
+hns-dnssec = { path = "crates/hns-dnssec" }
+hns-gateway = { path = "crates/hns-gateway" }
+hns-p2p = { path = "crates/hns-p2p" }
+hns-resolver = { path = "crates/hns-resolver" }
+hns-sync = { path = "crates/hns-sync" }
+hns-transport = { path = "crates/hns-transport" }
+hns-urkel = { path = "crates/hns-urkel" }
+jni = "0.21"
+num-bigint = "0.4"
+num-traits = "0.2"
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+rcgen = { version = "0.14.8", default-features = false, features = ["ring"] }
+ring = "0.17.14"
+rusqlite = { version = "0.39", features = ["bundled"] }
+rustls = { version = "0.23.41", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+sha3 = "0.10"
+thiserror = "2"
+webpki-roots = "1.0.8"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"

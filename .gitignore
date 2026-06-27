@@ -1,0 +1,49 @@
+# Gradle/Rust build state
+.gradle/
+build/
+target/
+android/.gradle/
+android/build/
+android/app/build/
+rust/target/
+rust/fuzz/target/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+*.iml
+*.swp
+
+# Env/secrets
+.env
+.env.*
+*.keystore
+*.jks
+*.p12
+*.pem
+*.key
+*.asc
+*.log
+local.properties
+keystore.properties
+signing.properties
+release.properties
+google-services.json
+service-account*.json
+credentials*.json
+
+# Android artifacts
+*.apk
+*.aab
+*.apks
+*.idsig
+captures/
+.externalNativeBuild/
+.cxx/
+*.hprof
+*.prof
+*.profm
+
+# Kotlin/Gradle extras
+.kotlin/

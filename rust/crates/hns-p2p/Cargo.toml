@@ -1,0 +1,12 @@
+[package]
+name = "hns-p2p"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hns-core.workspace = true
+hns-urkel.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true

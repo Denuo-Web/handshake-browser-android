@@ -1,0 +1,18 @@
+<resources>
+    <string name="app_name">Handshake Browser</string>
+    <string name="omnibox_hint">Search or enter HNS name</string>
+    <string name="security_syncing">Syncing</string>
+    <string name="security_hns_verified">HNS verified</string>
+    <string name="security_hns_compat">HNS via DoH</string>
+    <string name="security_dane_verified">DANE verified</string>
+    <string name="security_dane_compat">DANE via DoH</string>
+    <string name="security_webpki">WebPKI</string>
+    <string name="security_hns_webpki">HNS + WebPKI</string>
+    <string name="security_failed">Validation failed</string>
+    <string name="sync_notification_channel">Handshake sync</string>
+    <string name="sync_notification_title">Handshake sync active</string>
+    <string name="sync_notification_starting">Starting header and proof sync</string>
+    <string name="sync_notification_running">Keeping HNS proofs current</string>
+    <string name="sync_notification_error">Sync needs network or peer recovery</string>
+    <string name="sync_notification_stop">Stop</string>
+</resources>

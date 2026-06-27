@@ -1,0 +1,39 @@
+# Version Audit
+
+Audit date: 2026-06-25.
+
+The plan requires checking moving package and API versions before implementation. These pins prefer current stable releases when a stable line exists, and avoid alpha Android dependencies unless the feature is required.
+
+| Component | Pinned | Audit source |
+| --- | --- | --- |
+| Android Gradle Plugin | `9.2.0` | https://developer.android.com/build/releases/agp-9-2-0-release-notes |
+| Gradle distribution | `9.6.0` | https://gradle.org/releases/ |
+| Kotlin | `2.4.0` | https://blog.jetbrains.com/kotlin/2026/06/kotlin-2-4-0-released/ |
+| AndroidX WebKit | `1.16.0` | https://developer.android.com/jetpack/androidx/releases/webkit |
+| UniFFI | `0.31.1` | https://crates.io/crates/uniffi |
+| cargo-ndk | `4.1.2` | https://crates.io/crates/cargo-ndk/versions |
+| hickory-proto | `0.26.1` | https://crates.io/crates/hickory-proto |
+| rustls | `0.23.41` | https://crates.io/crates/rustls |
+| webpki-roots | `1.0.8` | https://crates.io/crates/webpki-roots |
+| rcgen | `0.14.8` | https://crates.io/crates/rcgen |
+| quinn | `0.11.9` | https://crates.io/crates/quinn/versions |
+| h3 | `0.0.8` | https://crates.io/crates/h3/versions |
+| rusqlite | `0.39.0` | https://crates.io/crates/rusqlite |
+| p256 | `0.13.2` | https://crates.io/crates/p256 |
+| ring | `0.17.14` | https://crates.io/crates/ring |
+
+Notes:
+
+- AndroidX WebKit also has a `1.17.0-alpha` line. The app pins `1.16.0` because `ProxyController` is already available and the plan calls for stable dependencies by default.
+- Gradle is pinned to `9.6.0` because the release page lists it as the current stable release on the audit date.
+- AGP 9 has built-in Kotlin support, so the Android module intentionally does not apply `org.jetbrains.kotlin.android`. See https://developer.android.com/build/migrate-to-built-in-kotlin.
+- `hickory-proto` remains a protocol dependency only. DNSSEC legacy RSA/SHA-1, ECDSA P-256/SHA-256, ECDSA P-384/SHA-384, RSA/SHA-256, RSA/SHA-512, Ed25519, SHA-1/SHA-256/SHA-384 DS/DNSKEY delegation-link validation, RRSIG signed-data, signed DNSKEY RRset, delegated-chain, NSEC no-data/name-range/name-error validation, RFC 5155 NSEC3 no-data/name-error/DS/wildcard/referral validation, RFC 4034 canonical RDATA name handling, and RFC 9460 SVCB/HTTPS RDATA primitives are implemented locally. Remaining DNSSEC algorithms and unknown NSEC3 hash algorithms stay fail-closed until full algorithm and advisory review is complete.
+- Urkel proof payload decoding and verification are implemented locally against the upstream `urkel` proof format used by HSD `proof` packets. HSD resource value decoding is implemented locally for DS, NS, GLUE4/GLUE6, SYNTH4/SYNTH6, and TXT records, with resolver adapters plus in-memory and SQLite providers for verified proof values, resource-cache byte accounting, chain-root/height anchoring, current-tip invalidation, active cap enforcement, clear-cache support, and oldest-entry eviction. Header storage now validates the exact mainnet genesis header, enforces HSD-compatible mainnet difficulty retarget bits, maintains a canonical hash-by-height index for reorg-aware best-chain lookups, and appends canonical tip updates for normal chain growth. Blocking TCP peer connections are implemented for version/verack, getheaders, and getproof flows, with static peer seeding, HSD-compatible DNS seed discovery, address-group-aware peer diversity, SQLite peer-state persistence, a bounded multi-batch header sync runner that records peer outcomes, a foreground-service-owned Android native sync tick, sync status broadcasts, sync/cache status diagnostics, a proof scheduler that stores verified resource values for resolver use, gateway-time live proof fetches from peers at or above the local anchor height on verified-resource cache miss, and Android native gateway paths that read those current-tip anchored persistent verified resources for loopback HNS HTTP plus bodyless WebView HNS HTTP/HTTPS interception with bounded header/body forwarding where request bodies are available. The delegated resolver now accepts NXDOMAIN only as a DNSSEC-validated NSEC/NSEC3 name-error denial instead of classifying it as malformed DNS. The gateway also performs origin-focused A/AAAA lookup after Android gateway requests, separates HTTPS/SVCB lookup from address lookup, applies parsed HTTPS/SVCB ALPN and service-port policy only when the configured origin transport supports the selected protocol, preserves HTTP/1.1 default fallback when SVCB permits it, maps delegated nameserver failures into actionable browser errors, supports strict and compatibility HNS HTTPS policy modes, reports DANE/WebPKI fallback and resolver compatibility policy back to Android, routes dotted HNS hosts by final HNS root label instead of leaking them to Chromium DNS, uses an Android-only HNS DoH compatibility resolver for delegated nameserver transport/validation failures when the DoH response matches the request and carries authenticated-data, and supports local HNS CONNECT termination with native rcgen per-host certificates plus exact WebView certificate-fingerprint pinning.
+- HNS WebSocket/HTTP Upgrade requests are now explicitly fail-closed before native gateway routing so hop-by-hop `Upgrade` and `Connection: Upgrade` headers cannot be stripped into a misleading normal GET. Normal ICANN HTTP Upgrade traffic is preserved by the loopback proxy tunnel path. Full HNS WebSocket support still requires a native stream handoff after HNS resolution, HTTPS/SVCB policy, and DANE validation.
+- Native HNS WebView interception can now stream decoded origin response bodies into temporary files and return a fixed-length header block to Android, avoiding the previous all-response byte-array path for bodyless WebView and Service Worker HNS requests. Decoded chunked bodies suppress stale `Transfer-Encoding` and mismatched `Content-Length` before WebView receives them.
+- An Android instrumentation test now validates the real HNS CONNECT termination path on-device: the loopback proxy generates a native per-host TLS certificate, completes a TLS handshake, pins the certificate fingerprint for WebView SSL policy, rejects an ICANN URL for that pinned certificate, and forwards a bounded HNS HTTPS POST body through the native gateway bridge.
+- Live-device validation on 2026-06-26 confirmed `welcome.2d` is classified and intercepted as HNS, then fails closed as `HNS Nameserver Response Invalid` because the delegated nameserver path does not return usable secure origin data. The same live audit found the supplied `theshake` and `niami` records lack usable secure apex origin address/TLSA responses for this strict gateway path, so their current failures are site/delegation data failures after the gateway address-query fix rather than the previous origin-address-selection bug. A follow-up live-device test on 2026-06-26 confirmed `https://nathan.woodburn/` loads through the Android HNS DoH compatibility resolver after the advertised delegated nameservers returned ICANN-root NXDOMAIN while HNS DoH returned AD-secure A and TLSA answers; the current UI now reports this path as `DANE via DoH` rather than plain local DANE.
+- `rustls` is pinned to the stable `0.23.41` line with the `ring` provider for Android-oriented builds. `cargo search` currently advertises `0.24.0-dev.0` as latest, but this project avoids dev prereleases for transport security code.
+- `ring` is pinned to `0.17.14` and reused for DNSSEC RSA, ECDSA P-384/SHA-384, and Ed25519 verification because it is already the rustls crypto provider in this workspace.
+- `p256` is pinned to the stable `0.13.2` line because the current crates.io latest advertised by `cargo search` is a `0.14.0-rc` prerelease.
+- `rusqlite` is pinned to `0.39.0` in this workspace because `0.40.1` currently pulls a `libsqlite3-sys` build script that fails on the available Rust 1.92 toolchain with an unstable `cfg_select` feature.

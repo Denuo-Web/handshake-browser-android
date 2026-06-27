@@ -1,0 +1,14 @@
+[package]
+name = "hns-sync"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hns-chain.workspace = true
+hns-core.workspace = true
+hns-p2p.workspace = true
+hns-resolver.workspace = true
+hns-urkel.workspace = true
+thiserror.workspace = true

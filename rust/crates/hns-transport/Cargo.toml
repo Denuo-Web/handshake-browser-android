@@ -1,0 +1,15 @@
+[package]
+name = "hns-transport"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hns-dane.workspace = true
+rustls.workspace = true
+thiserror.workspace = true
+webpki-roots.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true

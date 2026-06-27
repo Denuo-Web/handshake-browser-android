@@ -1,0 +1,50 @@
+[package]
+name = "hns-browser-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+hns-core = { path = "../crates/hns-core" }
+hns-dane = { path = "../crates/hns-dane" }
+hns-p2p = { path = "../crates/hns-p2p" }
+hns-urkel = { path = "../crates/hns-urkel" }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "dns_message"
+path = "fuzz_targets/dns_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hns_resource"
+path = "fuzz_targets/hns_resource.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "p2p_frame"
+path = "fuzz_targets/p2p_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "urkel_proof"
+path = "fuzz_targets/urkel_proof.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tlsa_record"
+path = "fuzz_targets/tlsa_record.rs"
+test = false
+doc = false
+bench = false

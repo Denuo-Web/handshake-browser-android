@@ -1,0 +1,13 @@
+[package]
+name = "hns-gateway"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hns-core.workspace = true
+hns-dane.workspace = true
+hns-resolver.workspace = true
+hns-transport.workspace = true
+thiserror.workspace = true

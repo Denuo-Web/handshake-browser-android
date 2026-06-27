@@ -1,0 +1,10 @@
+[package]
+name = "hns-urkel"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hns-core.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,328 @@
+package com.handshake.browser.ui
+
+import android.Manifest
+import android.annotation.SuppressLint
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
+import android.graphics.Color
+import android.os.Bundle
+import android.view.Gravity
+import android.view.inputmethod.EditorInfo
+import android.webkit.CookieManager
+import android.webkit.ServiceWorkerController
+import android.webkit.SslErrorHandler
+import android.webkit.WebResourceRequest
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.net.http.SslError
+import android.widget.EditText
+import android.widget.ImageButton
+import android.widget.LinearLayout
+import android.widget.TextView
+import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
+import androidx.core.content.ContextCompat
+import com.handshake.browser.BuildConfig
+import com.handshake.browser.R
+import com.handshake.browser.core.BrowserSecurityPolicy
+import com.handshake.browser.core.BrowserTargetKind
+import com.handshake.browser.core.BrowserUrlClassifier
+import com.handshake.browser.core.HnsPageResolverPolicy
+import com.handshake.browser.core.HnsPageTlsPolicy
+import com.handshake.browser.core.SecurityState
+import com.handshake.browser.net.HnsProxyController
+import com.handshake.browser.net.HnsServiceWorkerGatewayClient
+import com.handshake.browser.net.HnsSyncForegroundService
+import com.handshake.browser.net.HnsSyncSnapshot
+import com.handshake.browser.net.HnsWebViewGatewayInterceptor
+import com.handshake.browser.net.HnsWebViewSslErrorPolicy
+import com.handshake.browser.net.LoopbackProxyServer
+import com.handshake.browser.net.NativeBridge
+
+class MainActivity : ComponentActivity() {
+    private val classifier = BrowserUrlClassifier()
+    private val syncSnapshotReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action != HnsSyncForegroundService.ACTION_SYNC_SNAPSHOT) {
+                return
+            }
+
+            val statusJson = intent.getStringExtra(HnsSyncForegroundService.EXTRA_STATUS_JSON) ?: return
+            lastSyncSnapshot = HnsSyncSnapshot(
+                statusJson = statusJson,
+                updatedAtMillis = intent.getLongExtra(
+                    HnsSyncForegroundService.EXTRA_UPDATED_AT_MILLIS,
+                    System.currentTimeMillis(),
+                ),
+            )
+            refreshSecurityState()
+        }
+    }
+    private lateinit var webView: WebView
+    private lateinit var omnibox: EditText
+    private lateinit var securityLabel: TextView
+    private lateinit var proxyController: HnsProxyController
+    private lateinit var loopbackProxyServer: LoopbackProxyServer
+    private lateinit var webViewGatewayInterceptor: HnsWebViewGatewayInterceptor
+    private var proxyAvailable: Boolean = false
+    private var currentTargetKind: BrowserTargetKind? = null
+    private var mainFrameHnsStatusCode: Int? = null
+    private var mainFrameHnsTlsPolicy: HnsPageTlsPolicy? = null
+    private var mainFrameHnsResolverPolicy: HnsPageResolverPolicy? = null
+    private var lastSyncSnapshot: HnsSyncSnapshot? = null
+    private var syncReceiverRegistered: Boolean = false
+
+    @SuppressLint("SetJavaScriptEnabled")
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
+        proxyController = HnsProxyController(this)
+        loopbackProxyServer = LoopbackProxyServer(DEFAULT_GATEWAY_PORT, filesDir)
+        webViewGatewayInterceptor = HnsWebViewGatewayInterceptor(
+            dataDir = filesDir,
+            allowProxyFallbackForBodyRequests = { proxyAvailable },
+            onMainFrameHnsStatus = { statusCode, tlsPolicy, resolverPolicy ->
+                runOnUiThread {
+                    mainFrameHnsStatusCode = statusCode
+                    mainFrameHnsTlsPolicy = tlsPolicy
+                    mainFrameHnsResolverPolicy = resolverPolicy
+                    refreshSecurityState()
+                }
+            },
+        )
+        configureServiceWorkerInterception()
+        requestNotificationPermissionIfNeeded()
+
+        omnibox = EditText(this).apply {
+            hint = getString(R.string.omnibox_hint)
+            setSingleLine(true)
+            imeOptions = EditorInfo.IME_ACTION_GO
+            setSelectAllOnFocus(true)
+            setOnEditorActionListener { _, actionId, _ ->
+                if (actionId == EditorInfo.IME_ACTION_GO) {
+                    loadFromInput()
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+
+        securityLabel = TextView(this).apply {
+            gravity = Gravity.CENTER
+            setPadding(18, 0, 18, 0)
+            setTextColor(Color.rgb(28, 71, 75))
+            text = getString(R.string.security_syncing)
+        }
+
+        webView = WebView(this).apply {
+            settings.javaScriptEnabled = true
+            settings.domStorageEnabled = true
+            settings.loadsImagesAutomatically = true
+            settings.mediaPlaybackRequiresUserGesture = true
+            webViewClient = BrowserClient()
+        }
+
+        CookieManager.getInstance().setAcceptCookie(true)
+
+        val toolbar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(8, 8, 8, 8)
+            addView(navButton(android.R.drawable.ic_media_previous) { if (webView.canGoBack()) webView.goBack() })
+            addView(navButton(android.R.drawable.ic_media_next) { if (webView.canGoForward()) webView.goForward() })
+            addView(navButton(android.R.drawable.ic_popup_sync) { webView.reload() })
+            addView(omnibox, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(securityLabel, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ))
+            addView(navButton(android.R.drawable.ic_menu_info_details) {
+                startActivity(Intent(this@MainActivity, DiagnosticsActivity::class.java))
+            })
+        }
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            applySystemBarPadding()
+            addView(toolbar, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ))
+            addView(webView, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                0,
+                1f,
+            ))
+        }
+
+        setContentView(root)
+
+        val gatewayStarted = loopbackProxyServer.start()
+        proxyController.applyLoopbackProxy(DEFAULT_GATEWAY_PORT) { applied ->
+            proxyAvailable = applied && gatewayStarted
+            refreshSecurityState()
+        }
+
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                if (webView.canGoBack()) {
+                    webView.goBack()
+                } else {
+                    isEnabled = false
+                    onBackPressedDispatcher.onBackPressed()
+                }
+            }
+        })
+
+        if (savedInstanceState == null) {
+            loadTarget(classifier.classify(DEFAULT_HOME))
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        registerSyncSnapshotReceiver()
+        HnsSyncForegroundService.start(this)
+        lastSyncSnapshot = HnsSyncSnapshot(
+            statusJson = NativeBridge.syncStatus(filesDir.absolutePath),
+            updatedAtMillis = System.currentTimeMillis(),
+        )
+        refreshSecurityState()
+    }
+
+    override fun onStop() {
+        unregisterSyncSnapshotReceiver()
+        super.onStop()
+    }
+
+    override fun onDestroy() {
+        proxyController.clear {}
+        loopbackProxyServer.close()
+        super.onDestroy()
+    }
+
+    private fun registerSyncSnapshotReceiver() {
+        if (syncReceiverRegistered) {
+            return
+        }
+
+        ContextCompat.registerReceiver(
+            this,
+            syncSnapshotReceiver,
+            IntentFilter(HnsSyncForegroundService.ACTION_SYNC_SNAPSHOT),
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
+        syncReceiverRegistered = true
+    }
+
+    private fun configureServiceWorkerInterception() {
+        ServiceWorkerController.getInstance()
+            .setServiceWorkerClient(HnsServiceWorkerGatewayClient(webViewGatewayInterceptor))
+    }
+
+    private fun unregisterSyncSnapshotReceiver() {
+        if (!syncReceiverRegistered) {
+            return
+        }
+
+        unregisterReceiver(syncSnapshotReceiver)
+        syncReceiverRegistered = false
+    }
+
+    private fun requestNotificationPermissionIfNeeded() {
+        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) {
+            return
+        }
+
+        requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_NOTIFICATIONS)
+    }
+
+    private fun navButton(icon: Int, action: () -> Unit): ImageButton =
+        ImageButton(this).apply {
+            setImageResource(icon)
+            setBackgroundColor(Color.TRANSPARENT)
+            setOnClickListener { action() }
+        }
+
+    private fun loadFromInput() {
+        loadTarget(classifier.classify(omnibox.text.toString()))
+    }
+
+    private fun loadTarget(target: com.handshake.browser.core.BrowserTarget) {
+        omnibox.setText(target.url)
+        currentTargetKind = target.kind
+        mainFrameHnsStatusCode = null
+        mainFrameHnsTlsPolicy = null
+        mainFrameHnsResolverPolicy = null
+        refreshSecurityState()
+        webView.loadUrl(target.url)
+    }
+
+    private fun refreshSecurityState() {
+        setSecurityState(
+            BrowserSecurityPolicy.state(
+                targetKind = currentTargetKind,
+                proxyAvailable = proxyAvailable,
+                syncStatusJson = lastSyncSnapshot?.statusJson,
+                mainFrameHnsStatusCode = mainFrameHnsStatusCode,
+                mainFrameHnsTlsPolicy = mainFrameHnsTlsPolicy,
+                mainFrameHnsResolverPolicy = mainFrameHnsResolverPolicy,
+            ),
+        )
+    }
+
+    private fun setSecurityState(state: SecurityState) {
+        securityLabel.text = when (state) {
+            SecurityState.Syncing -> getString(R.string.security_syncing)
+            SecurityState.HnsVerified -> getString(R.string.security_hns_verified)
+            SecurityState.HnsCompatibility -> getString(R.string.security_hns_compat)
+            SecurityState.DaneVerified -> getString(R.string.security_dane_verified)
+            SecurityState.DaneCompatibility -> getString(R.string.security_dane_compat)
+            SecurityState.WebPkiOnly -> getString(R.string.security_webpki)
+            SecurityState.MixedPolicy -> getString(R.string.security_hns_webpki)
+            SecurityState.ValidationFailed -> getString(R.string.security_failed)
+            SecurityState.ProofUnavailable -> "Proof unavailable"
+        }
+    }
+
+    private inner class BrowserClient : WebViewClient() {
+        override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+            val target = classifier.classify(request.url.toString())
+            currentTargetKind = target.kind
+            mainFrameHnsStatusCode = null
+            mainFrameHnsTlsPolicy = null
+            mainFrameHnsResolverPolicy = null
+            refreshSecurityState()
+            return false
+        }
+
+        override fun shouldInterceptRequest(
+            view: WebView,
+            request: WebResourceRequest,
+        ) = webViewGatewayInterceptor.intercept(request) ?: super.shouldInterceptRequest(view, request)
+
+        @SuppressLint("WebViewClientOnReceivedSslError")
+        override fun onReceivedSslError(view: WebView, handler: SslErrorHandler, error: SslError) {
+            if (HnsWebViewSslErrorPolicy.canProceed(error)) {
+                handler.proceed()
+            } else {
+                handler.cancel()
+            }
+        }
+
+        override fun onPageFinished(view: WebView, url: String) {
+            omnibox.setText(url)
+        }
+    }
+
+    companion object {
+        private const val DEFAULT_GATEWAY_PORT = 15353
+        private const val DEFAULT_HOME = "https://handshake.org/"
+        private const val REQUEST_NOTIFICATIONS = 1002
+    }
+}

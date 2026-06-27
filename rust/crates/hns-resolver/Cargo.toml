@@ -1,0 +1,14 @@
+[package]
+name = "hns-resolver"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hns-cache.workspace = true
+hns-core.workspace = true
+hns-dane.workspace = true
+hns-dnssec.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true

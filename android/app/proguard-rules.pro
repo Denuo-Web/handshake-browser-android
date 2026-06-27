@@ -1,0 +1,1 @@
+-keep class com.handshake.browser.net.NativeBridge { *; }

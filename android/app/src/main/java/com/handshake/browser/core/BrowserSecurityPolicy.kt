@@ -1,0 +1,52 @@
+package com.handshake.browser.core
+
+object BrowserSecurityPolicy {
+    fun state(
+        targetKind: BrowserTargetKind?,
+        proxyAvailable: Boolean,
+        syncStatusJson: String?,
+        mainFrameHnsStatusCode: Int? = null,
+        mainFrameHnsTlsPolicy: HnsPageTlsPolicy? = null,
+        mainFrameHnsResolverPolicy: HnsPageResolverPolicy? = null,
+    ): SecurityState {
+        if (targetKind != BrowserTargetKind.HnsName) {
+            return SecurityState.WebPkiOnly
+        }
+        if (!proxyAvailable) {
+            return SecurityState.ProofUnavailable
+        }
+        if (mainFrameHnsStatusCode?.let { it in 400..599 } == true) {
+            return SecurityState.ValidationFailed
+        }
+        if (mainFrameHnsStatusCode?.let { it in 200..299 } == true) {
+            if (mainFrameHnsTlsPolicy == HnsPageTlsPolicy.Dane) {
+                if (mainFrameHnsResolverPolicy == HnsPageResolverPolicy.HnsDohCompatibility) {
+                    return SecurityState.DaneCompatibility
+                }
+                return SecurityState.DaneVerified
+            }
+            if (mainFrameHnsTlsPolicy == HnsPageTlsPolicy.WebPkiFallback) {
+                return SecurityState.MixedPolicy
+            }
+            if (mainFrameHnsResolverPolicy == HnsPageResolverPolicy.HnsDohCompatibility) {
+                return SecurityState.HnsCompatibility
+            }
+            return SecurityState.HnsVerified
+        }
+        if (syncStatusJson.hasSyncStatus("synced") || syncStatusJson.hasSyncStatus("up_to_date")) {
+            return SecurityState.HnsVerified
+        }
+        if (
+            syncStatusJson.hasSyncStatus("error") ||
+            syncStatusJson.hasSyncStatus("seed_failed") ||
+            syncStatusJson.hasSyncStatus("peer_failed")
+        ) {
+            return SecurityState.ProofUnavailable
+        }
+
+        return SecurityState.Syncing
+    }
+
+    private fun String?.hasSyncStatus(status: String): Boolean =
+        this?.contains("\"status\":\"$status\"") == true
+}
