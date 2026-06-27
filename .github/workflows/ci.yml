@@ -22,9 +22,15 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
-      - uses: android-actions/setup-android@v3
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          gradle-version: "9.6.0"
-      - run: gradle assembleDebug testDebugUnitTest
+          targets: aarch64-linux-android,x86_64-linux-android
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager "platforms;android-37" "ndk;28.2.13676358"
+      - run: |
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+      - run: cargo install cargo-ndk --version 4.1.2 --locked
+      - uses: gradle/actions/setup-gradle@v4
+      - run: ./gradlew assembleDebug testDebugUnitTest
         working-directory: android
