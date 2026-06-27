@@ -453,9 +453,6 @@ class MainActivity : ComponentActivity() {
             pageLoadProgress = pageLoadProgress.coerceAtLeast(5)
             omnibox.setText(url)
             currentTargetKind = classifier.classify(url).kind
-            mainFrameHnsStatusCode = null
-            mainFrameHnsTlsPolicy = null
-            mainFrameHnsResolverPolicy = null
             refreshSecurityState()
             refreshPageProgress()
         }
@@ -496,7 +493,9 @@ class MainActivity : ComponentActivity() {
     private inner class BrowserChromeClient : WebChromeClient() {
         override fun onProgressChanged(view: WebView, newProgress: Int) {
             pageLoadProgress = newProgress.coerceIn(0, PAGE_PROGRESS_MAX)
-            pageIsLoading = pageLoadProgress < PAGE_PROGRESS_MAX
+            if (pageLoadProgress < PAGE_PROGRESS_MAX) {
+                pageIsLoading = true
+            }
             refreshPageProgress()
         }
     }
