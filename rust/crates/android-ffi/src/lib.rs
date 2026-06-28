@@ -47,6 +47,7 @@ const DNSSEC_DO_FLAG: u32 = 0x8000;
 const DEFAULT_DNS_UDP_PAYLOAD: usize = 1232;
 const DEFAULT_GATEWAY_PROOF_PEERS: usize = 2;
 const DEFAULT_GATEWAY_PROOF_TIMEOUT: Duration = Duration::from_secs(3);
+const RESOURCE_PROOF_CACHE_CANONICAL_WINDOW: u32 = 144;
 const ANDROID_HEADER_SYNC_PEERS: usize = 12;
 const ANDROID_HEADER_SYNC_BATCHES_PER_PEER: usize = 16;
 const ANDROID_PARALLEL_PEER_PROBES: usize = 32;
@@ -136,20 +137,41 @@ impl GatewayProofProvider {
         root_name: &str,
         name_hash: NameHash,
     ) -> Result<ProvenNameRecords, ResolverError> {
-        let best = best_synced_header(&self.base)?;
         let verified = self.values.prove_resource_value(root_name, name_hash)?;
         if verified.root_name != root_name || verified.name_hash != name_hash || !verified.secure {
             return Err(ResolverError::ProofNameMismatch);
         }
-        if verified.anchor
-            != Some(ResourceValueAnchor {
-                tree_root: best.header.tree_root,
-                height: best.height,
-            })
-        {
+        if !self.anchor_is_recent_canonical(verified.anchor)? {
             return Err(ResolverError::ProofUnavailable);
         }
         ProvenNameRecords::from_verified_resource_value(verified)
+    }
+
+    fn anchor_is_recent_canonical(
+        &self,
+        anchor: Option<ResourceValueAnchor>,
+    ) -> Result<bool, ResolverError> {
+        let Some(anchor) = anchor else {
+            return Ok(false);
+        };
+        let header_store = SqliteHeaderStore::open(self.base.join("headers.sqlite"))
+            .map_err(|error| ResolverError::Storage(format!("open header store: {error}")))?;
+        let chain = HeaderChain::new(header_store);
+        let best = chain
+            .best_header()
+            .map_err(|error| ResolverError::Storage(format!("read best header: {error}")))?;
+        let Some(best) = best else {
+            return Ok(false);
+        };
+        if anchor.height.0 == 0 || anchor.height.0 > best.height.0 {
+            return Ok(false);
+        }
+        if best.height.0.saturating_sub(anchor.height.0) > RESOURCE_PROOF_CACHE_CANONICAL_WINDOW {
+            return Ok(false);
+        }
+        Ok(chain
+            .canonical_header(anchor.height)
+            .is_some_and(|header| header.header.tree_root == anchor.tree_root))
     }
 
     fn fetch_and_store_live_proof(
@@ -2398,19 +2420,40 @@ fn prune_resource_cache_to_best_chain(
 
     let provider = SqliteResourceValueProvider::open(path)
         .map_err(|error| format!("open resource cache: {error}"))?;
-    let valid_anchors = match chain
-        .best_header()
-        .map_err(|error| format!("read best header for resource cache anchors: {error}"))?
-    {
-        Some(best) if best.height.0 > 0 => vec![ResourceValueAnchor {
-            tree_root: best.header.tree_root,
-            height: best.height,
-        }],
-        _ => Vec::new(),
-    };
+    let valid_anchors = recent_canonical_resource_anchors(chain)?;
     provider
         .prune_invalid_anchors(&valid_anchors, true)
         .map_err(|error| format!("prune resource cache anchors: {error}"))
+}
+
+fn recent_canonical_resource_anchors(
+    chain: &HeaderChain<SqliteHeaderStore>,
+) -> Result<Vec<ResourceValueAnchor>, String> {
+    let Some(best) = chain
+        .best_header()
+        .map_err(|error| format!("read best header for resource cache anchors: {error}"))?
+    else {
+        return Ok(Vec::new());
+    };
+    if best.height.0 == 0 {
+        return Ok(Vec::new());
+    }
+
+    let first_height = best
+        .height
+        .0
+        .saturating_sub(RESOURCE_PROOF_CACHE_CANONICAL_WINDOW)
+        .max(1);
+    let mut anchors = Vec::new();
+    for height in first_height..=best.height.0 {
+        if let Some(header) = chain.canonical_header(Height(height)) {
+            anchors.push(ResourceValueAnchor {
+                tree_root: header.header.tree_root,
+                height: header.height,
+            });
+        }
+    }
+    Ok(anchors)
 }
 
 fn resource_cache_stats(base: &Path) -> Result<(usize, usize), String> {
@@ -3235,7 +3278,45 @@ mod tests {
     }
 
     #[test]
-    fn sync_once_prunes_resource_cache_entries_not_at_current_tip() {
+    fn sync_once_keeps_resource_cache_entries_on_recent_canonical_chain() {
+        let path = temp_dir_path("resource-cache-recent-canonical");
+        let base = path.join("hns");
+        std::fs::create_dir_all(&base).unwrap();
+        let older_root = Hash::new([3; 32]);
+        let current_root = Hash::new([4; 32]);
+        let heights = store_canonical_headers_with_tree_roots(&base, &[older_root, current_root]);
+        let resources = SqliteResourceValueProvider::open(base.join("resources.sqlite")).unwrap();
+        let alpha_hash = NameHash::from_name("alpha").unwrap();
+        let beta_hash = NameHash::from_name("beta").unwrap();
+        resources
+            .insert(
+                VerifiedResourceValue::inclusion("alpha".to_owned(), alpha_hash, vec![1, 2])
+                    .with_anchor(older_root, heights[0]),
+            )
+            .unwrap();
+        resources
+            .insert(
+                VerifiedResourceValue::inclusion("beta".to_owned(), beta_hash, vec![3])
+                    .with_anchor(current_root, heights[1]),
+            )
+            .unwrap();
+
+        let status = sync_once_with_options(
+            path.to_str().unwrap(),
+            false,
+            Duration::from_millis(1),
+            DEFAULT_RESOURCE_CACHE_LIMIT_BYTES,
+        );
+
+        assert_eq!(status.resource_cache_evicted, 0);
+        assert_eq!(status.resource_cache_entries, 2);
+        assert_eq!(status.resource_cache_bytes, 3);
+
+        cleanup_dir(&path);
+    }
+
+    #[test]
+    fn sync_once_prunes_resource_cache_entries_not_on_recent_canonical_chain() {
         let path = temp_dir_path("resource-cache-stale-tip");
         let base = path.join("hns");
         std::fs::create_dir_all(&base).unwrap();
@@ -3823,6 +3904,64 @@ mod tests {
     }
 
     #[test]
+    fn gateway_response_accepts_recent_canonical_cached_proof() {
+        let path = temp_dir_path("gateway-http-recent-proof");
+        let base = path.join("hns");
+        std::fs::create_dir_all(&base).unwrap();
+        let resources = SqliteResourceValueProvider::open(base.join("resources.sqlite")).unwrap();
+        let root_name = "welcome".to_owned();
+        let name_hash = NameHash::from_name(&root_name).unwrap();
+        let proof_root = Hash::new([5; 32]);
+        let newer_root = Hash::new([6; 32]);
+        let heights = store_canonical_headers_with_tree_roots(&base, &[proof_root, newer_root]);
+        resources
+            .insert(
+                VerifiedResourceValue::inclusion(
+                    root_name.clone(),
+                    name_hash,
+                    owner_glue4_resource(&root_name, [127, 0, 0, 1]),
+                )
+                .with_anchor(proof_root, heights[0]),
+            )
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0_u8; 512];
+            let count = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..count]);
+            assert!(request.starts_with("GET /recent HTTP/1.1\r\n"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nrecent",
+                )
+                .unwrap();
+        });
+
+        let response = gateway_http_response(GatewayHttpRequestInput {
+            data_dir: path.to_str().unwrap(),
+            method: "GET",
+            scheme: "http",
+            host: &root_name,
+            port,
+            path_and_query: "/recent",
+            header_text: "",
+            body: &[],
+        });
+        let text = String::from_utf8(response).unwrap();
+
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(text.ends_with("\r\n\r\nrecent"));
+        server.join().unwrap();
+        cleanup_dir(&path);
+    }
+
+    #[test]
     fn gateway_response_streams_body_to_file_with_fixed_length_head() {
         let path = temp_dir_path("gateway-file-body");
         let base = path.join("hns");
@@ -4032,6 +4171,16 @@ mod tests {
     }
 
     fn store_best_header_with_tree_root(base: &std::path::Path, tree_root: Hash) -> Height {
+        store_canonical_headers_with_tree_roots(base, &[tree_root])
+            .last()
+            .copied()
+            .unwrap()
+    }
+
+    fn store_canonical_headers_with_tree_roots(
+        base: &std::path::Path,
+        tree_roots: &[Hash],
+    ) -> Vec<Height> {
         let genesis_header = BlockHeader::mainnet_genesis();
         let genesis = StoredHeader {
             hash: genesis_header.hash(),
@@ -4039,25 +4188,32 @@ mod tests {
             header: genesis_header,
             height: Height(0),
         };
-        let mut header = BlockHeader::mainnet_genesis();
-        header.prev_block = genesis.hash;
-        header.tree_root = tree_root;
-        header.time = header.time.saturating_add(1);
-        header.extra_nonce[0] = 1;
-        let header_work = Chainwork::from_bits(header.bits).unwrap();
-        let stored = StoredHeader {
-            hash: header.hash(),
-            chainwork: genesis.chainwork.checked_add(&header_work),
-            header,
-            height: Height(1),
-        };
+        let mut headers = vec![genesis.clone()];
+        let mut previous = genesis;
+        let mut heights = Vec::new();
+        for (index, tree_root) in tree_roots.iter().copied().enumerate() {
+            let mut header = BlockHeader::mainnet_genesis();
+            header.prev_block = previous.hash;
+            header.tree_root = tree_root;
+            header.time = header.time.saturating_add((index as u64) + 1);
+            header.extra_nonce[..4].copy_from_slice(&((index as u32) + 1).to_le_bytes());
+            let header_work = Chainwork::from_bits(header.bits).unwrap();
+            let stored = StoredHeader {
+                hash: header.hash(),
+                chainwork: previous.chainwork.checked_add(&header_work),
+                header,
+                height: Height(previous.height.0 + 1),
+            };
+            heights.push(stored.height);
+            headers.push(stored.clone());
+            previous = stored;
+        }
         let mut store = SqliteHeaderStore::open(base.join("headers.sqlite")).unwrap();
-        store.put_header(genesis.clone()).unwrap();
-        store.put_header(stored.clone()).unwrap();
-        store
-            .replace_canonical_chain(&[genesis, stored.clone()])
-            .unwrap();
-        stored.height
+        for header in &headers {
+            store.put_header(header.clone()).unwrap();
+        }
+        store.replace_canonical_chain(&headers).unwrap();
+        heights
     }
 
     fn urkel_exists_payload(value: &[u8]) -> Vec<u8> {

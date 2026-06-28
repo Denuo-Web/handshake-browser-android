@@ -57,11 +57,38 @@ class HnsSyncSchedulerTest {
             ),
         )
         assertEquals(
+            13L,
+            scheduler.nextDelayMs(
+                HnsSyncSnapshot(
+                    statusJson = """{"status":"synced","accepted":1,"bestHeight":335684,"bestPeerHeight":335684}""",
+                    updatedAtMillis = 6L,
+                ),
+            ),
+        )
+        assertEquals(
+            13L,
+            scheduler.nextDelayMs(
+                HnsSyncSnapshot(
+                    statusJson = """{"status":"attempted","bestHeight":335684,"bestPeerHeight":335684}""",
+                    updatedAtMillis = 7L,
+                ),
+            ),
+        )
+        assertEquals(
             7L,
             scheduler.nextDelayMs(
                 HnsSyncSnapshot(
-                    statusJson = """{"status":"syncing","bestHeight":92000,"bestPeerHeight":null,"estimatedTipHeight":335684,"peerCount":0}""",
+                    statusJson = """{"status":"syncing","accepted":2000,"bestHeight":92000,"bestPeerHeight":null,"estimatedTipHeight":335684,"peerCount":0}""",
                     updatedAtMillis = 3L,
+                ),
+            ),
+        )
+        assertEquals(
+            13L,
+            scheduler.nextDelayMs(
+                HnsSyncSnapshot(
+                    statusJson = """{"status":"up_to_date","accepted":0,"bestHeight":335680,"bestPeerHeight":null,"estimatedTipHeight":335684,"peerCount":23}""",
+                    updatedAtMillis = 8L,
                 ),
             ),
         )

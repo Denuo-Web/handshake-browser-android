@@ -25,14 +25,24 @@ data class HnsSyncProgress(
             return target > best
         }
 
+    val isBehindKnownPeer: Boolean
+        get() {
+            val best = bestHeight ?: return false
+            val peer = bestPeerHeight ?: return false
+            return peer > best
+        }
+
     val shouldContinueSoon: Boolean
-        get() = isBehind || hasUnknownTargetProgress || status in ACTIVE_STATUSES
+        get() = isBehindKnownPeer || hasUnknownTargetProgress || status == "syncing"
 
     val shouldRetrySoon: Boolean
         get() = status in RETRY_STATUSES || needsPeerDiscovery
 
     val hasUnknownTargetProgress: Boolean
-        get() = bestHeight != null && bestHeight > 0L && bestPeerHeight == null
+        get() = bestHeight != null &&
+            bestHeight > 0L &&
+            bestPeerHeight == null &&
+            ((accepted ?: 0L) > 0L || status == "syncing")
 
     val needsPeerDiscovery: Boolean
         get() = status == "idle" && (peerCount ?: 0L) == 0L
@@ -68,7 +78,6 @@ data class HnsSyncProgress(
         NumberFormat.getIntegerInstance(Locale.US).format(this)
 
     companion object {
-        private val ACTIVE_STATUSES = setOf("syncing", "synced", "attempted")
         private val RETRY_STATUSES = setOf("error", "peer_failed", "seed_failed")
 
         fun fromJson(statusJson: String?): HnsSyncProgress {

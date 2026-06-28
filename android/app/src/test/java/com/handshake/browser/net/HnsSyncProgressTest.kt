@@ -17,6 +17,7 @@ class HnsSyncProgressTest {
         assertEquals(335_684L, progress.bestPeerHeight)
         assertEquals(2_000L, progress.accepted)
         assertTrue(progress.isBehind)
+        assertTrue(progress.isBehindKnownPeer)
         assertTrue(progress.shouldContinueSoon)
         assertEquals(278, progress.progressPermille())
         assertEquals(
@@ -39,17 +40,30 @@ class HnsSyncProgressTest {
     @Test
     fun estimatedTipDrivesProgressWhenPeerHeightIsUnknown() {
         val progress = HnsSyncProgress.fromJson(
-            """{"status":"syncing","bestHeight":92000,"bestPeerHeight":null,"estimatedTipHeight":335684,"peerCount":0}""",
+            """{"status":"syncing","accepted":2000,"bestHeight":92000,"bestPeerHeight":null,"estimatedTipHeight":335684,"peerCount":0}""",
         )
 
         assertTrue(progress.isBehind)
+        assertFalse(progress.isBehindKnownPeer)
         assertTrue(progress.hasUnknownTargetProgress)
         assertTrue(progress.shouldContinueSoon)
         assertEquals(274, progress.progressPermille())
         assertEquals(
-            "syncing • bestHeight 92,000 • target 335,684",
+            "syncing • bestHeight 92,000 • target 335,684 • accepted +2,000",
             progress.summary(),
         )
+    }
+
+    @Test
+    fun estimatedTipAloneDoesNotForceActivePolling() {
+        val progress = HnsSyncProgress.fromJson(
+            """{"status":"up_to_date","accepted":0,"bestHeight":335680,"bestPeerHeight":null,"estimatedTipHeight":335684,"peerCount":23}""",
+        )
+
+        assertTrue(progress.isBehind)
+        assertFalse(progress.isBehindKnownPeer)
+        assertFalse(progress.hasUnknownTargetProgress)
+        assertFalse(progress.shouldContinueSoon)
     }
 
     @Test
