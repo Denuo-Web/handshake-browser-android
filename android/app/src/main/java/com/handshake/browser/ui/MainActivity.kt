@@ -47,6 +47,7 @@ import com.handshake.browser.core.BrowserUrlClassifier
 import com.handshake.browser.core.HnsPageResolverPolicy
 import com.handshake.browser.core.HnsPageTlsPolicy
 import com.handshake.browser.core.SecurityState
+import com.handshake.browser.net.GatewayEventLog
 import com.handshake.browser.net.HnsProxyController
 import com.handshake.browser.net.HnsServiceWorkerGatewayClient
 import com.handshake.browser.net.HnsSyncProgress
@@ -113,6 +114,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
+        GatewayEventLog.configureAppStorage(filesDir)
         proxyController = HnsProxyController(this)
         loopbackProxyServer = LoopbackProxyServer(
             EPHEMERAL_GATEWAY_PORT,

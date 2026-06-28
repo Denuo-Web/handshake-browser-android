@@ -1,5 +1,7 @@
 package com.handshake.browser.net
 
+import java.io.File
+import java.nio.charset.StandardCharsets
 import java.util.Locale
 
 internal data class GatewayEvent(
@@ -12,7 +14,34 @@ internal data class GatewayEvent(
 
 internal object GatewayEventLog {
     private const val MAX_EVENTS = 25
+    private const val STORE_FILE_NAME = "gateway-events.log"
+    private const val FIELD_SEPARATOR = "\t"
     private val events = ArrayDeque<GatewayEvent>()
+    private var storeFile: File? = null
+
+    @Synchronized
+    fun configureAppStorage(filesDir: File) {
+        configure(File(filesDir, STORE_FILE_NAME))
+    }
+
+    @Synchronized
+    fun configure(file: File?) {
+        if (storeFile?.absolutePath == file?.absolutePath) {
+            return
+        }
+        storeFile = file
+        events.clear()
+        if (file == null || !file.isFile) {
+            return
+        }
+        runCatching {
+            file.readLines(StandardCharsets.UTF_8)
+                .mapNotNull(::parseEventLine)
+                .takeLast(MAX_EVENTS)
+                .forEach(events::addLast)
+            persistLocked()
+        }
+    }
 
     @Synchronized
     fun record(stage: String, host: String, status: Int, reason: String) {
@@ -28,6 +57,7 @@ internal object GatewayEventLog {
         while (events.size > MAX_EVENTS) {
             events.removeFirst()
         }
+        persistLocked()
     }
 
     @Synchronized
@@ -46,6 +76,43 @@ internal object GatewayEventLog {
     @Synchronized
     fun clear() {
         events.clear()
+        runCatching { storeFile?.delete() }
+    }
+
+    private fun persistLocked() {
+        val file = storeFile ?: return
+        runCatching {
+            file.parentFile?.mkdirs()
+            val contents = if (events.isEmpty()) {
+                ""
+            } else {
+                events.joinToString(separator = "\n", postfix = "\n", transform = ::serializeEvent)
+            }
+            file.writeText(contents, StandardCharsets.UTF_8)
+        }
+    }
+
+    private fun serializeEvent(event: GatewayEvent): String =
+        listOf(
+            event.timestampMillis.toString(),
+            event.stage,
+            event.host,
+            event.status.toString(),
+            event.reason,
+        ).joinToString(FIELD_SEPARATOR)
+
+    private fun parseEventLine(line: String): GatewayEvent? {
+        val parts = line.split(FIELD_SEPARATOR, limit = 5)
+        if (parts.size != 5) {
+            return null
+        }
+        return GatewayEvent(
+            timestampMillis = parts[0].toLongOrNull()?.takeIf { it >= 0 } ?: return null,
+            stage = parts[1].sanitizeToken(),
+            host = parts[2].sanitizeHost(),
+            status = parts[3].toIntOrNull() ?: return null,
+            reason = parts[4].sanitizeReason(),
+        )
     }
 
     private fun String.sanitizeHost(): String {

@@ -19,6 +19,7 @@ The default proof-backed path does not trust a single peer, external HNS resolve
 - No-network sync status reads may report `up_to_date` only when stored peer heights are not ahead of a non-genesis local best header.
 - Gateway exposure beyond loopback: configuration error.
 - Browser-visible HNS gateway errors must identify the failing stage without exposing private request bodies.
+- Gateway diagnostics must persist only bounded, sanitized stage/host/status/reason events in app-private storage; paths, query strings, request headers, and response/request bodies stay out of default logs.
 - Verified HNS non-inclusion must surface as name-not-found instead of origin-address-missing.
 
 ## Hardened WebView Profile
@@ -106,6 +107,7 @@ Applied WebView controls:
 - No origin fetch unless the gateway resolution name matches the requested origin host.
 - No intercepted HNS redirect should be followed unless the target remains inside HNS resolution policy and the redirect chain stays under the configured bound.
 - No main-frame HNS gateway 4xx/5xx response should leave the toolbar in verified state.
+- No gateway diagnostic event should persist URL paths, query strings, request headers, request bodies, or response bodies; the app-private event store remains bounded to recent sanitized failures.
 - No HNS origin connect attempt should use origin-host system DNS when secure resolution has not produced an explicit connect address.
 - No insecure resolver result when gateway secure-resolution mode is enabled.
 - No proxy request body should be forwarded or dropped unless HTTP/1.1 framing is unambiguous and supported.

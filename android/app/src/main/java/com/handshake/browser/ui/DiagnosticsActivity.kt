@@ -18,6 +18,7 @@ import kotlin.concurrent.thread
 class DiagnosticsActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        GatewayEventLog.configureAppStorage(filesDir)
         HnsSyncForegroundService.start(this)
 
         val root = LinearLayout(this).apply {
