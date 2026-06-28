@@ -5,15 +5,16 @@ use hns_core::dns::{
 };
 use hns_core::network;
 use hns_core::{BlockHeader, Height, NameHash};
-use hns_dane::DaneDecision;
+use hns_dane::{DaneDecision, TlsaMatching, TlsaRecord, TlsaSelector, TlsaUsage};
 use hns_gateway::{Gateway, GatewayConfig, GatewayError, GatewayRequest, HnsHttpsMode};
 use hns_p2p::{
     DnsSeedPeerSource, HeaderSyncSession, PeerConnection, SqlitePeerStore, VersionPacket,
 };
 use hns_resolver::{
-    AuthoritativeDnssecResolver, DelegatingResolver, HnsProofProvider, HnsResourceValueProvider,
-    ProvenNameRecords, ResolutionAnswer, ResolutionRequest, Resolver, ResolverError,
-    ResourceValueAnchor, SqliteResourceValueProvider,
+    AuthoritativeDnssecResolver, DelegatingResolver, DnsTransport, HnsProofProvider,
+    HnsResourceValueProvider, ProvenNameRecords, ResolutionAnswer, ResolutionRequest, Resolver,
+    ResolverError, ResourceValueAnchor, SqliteResourceValueProvider, SystemDnssecVerifier,
+    UdpTcpDnsTransport,
 };
 use hns_sync::{
     HeaderSyncCoordinator, HeaderSyncRunner, HeaderSyncRunnerConfig, ProofScheduler, SyncError,
@@ -21,7 +22,7 @@ use hns_sync::{
 };
 use hns_transport::{
     OriginProtocol, OriginRequest, OriginResponse, OriginResponseHead, OriginTransport,
-    TcpHttpTransport, TlsValidation, TransportError,
+    TcpHttpTransport, TlsCertificateInspection, TlsValidation, TransportError,
 };
 use hns_urkel::UrkelProofVerifier;
 use jni::JNIEnv;
@@ -31,8 +32,8 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_RESOURCE_CACHE_LIMIT_BYTES: usize = 50 * 1024 * 1024;
@@ -52,6 +53,10 @@ const MAINNET_GENESIS_TIME: u64 = 1_580_745_078;
 const MAINNET_TARGET_SPACING_SECONDS: u64 = 10 * 60;
 const HNS_DOH_HOST: &str = "hnsdoh.com";
 const HNS_DOH_PATH: &str = "/dns-query";
+const HNS_GATEWAY_STRICT_MODE_HEADER: &str = "X-HNS-Browser-Strict-Mode";
+const HNS_RESOLUTION_TRACE_HEADER: &str = "X-HNS-Resolution-Trace";
+const HNS_RESOLVER_MODE_HEADER: &str = "X-HNS-Resolver-Mode";
+const HNS_DOH_FALLBACK_HEADER: &str = "X-HNS-DoH-Fallback";
 static DOH_QUERY_ID: AtomicU16 = AtomicU16::new(0x484e);
 
 pub struct GatewayHttpRequestInput<'a> {
@@ -63,6 +68,34 @@ pub struct GatewayHttpRequestInput<'a> {
     pub path_and_query: &'a str,
     pub header_text: &'a str,
     pub body: &'a [u8],
+}
+
+struct ParsedGatewayHeaders {
+    headers: Vec<(String, String)>,
+    strict_hns_mode: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GatewayResolutionMode {
+    Strict,
+    Compatibility,
+}
+
+impl GatewayResolutionMode {
+    fn from_strict_hns_mode(strict_hns_mode: bool) -> Self {
+        if strict_hns_mode {
+            Self::Strict
+        } else {
+            Self::Compatibility
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Compatibility => "compatibility",
+        }
+    }
 }
 
 struct JniGatewayHttpRequest<'local> {
@@ -214,23 +247,155 @@ impl HnsProofProvider for GatewayProofProvider {
     }
 }
 
+type AndroidPrimaryResolver = DelegatingResolver<
+    GatewayProofProvider,
+    AuthoritativeDnssecResolver<TracingDnsTransport<UdpTcpDnsTransport>, SystemDnssecVerifier>,
+>;
+
+enum AndroidGatewayResolver {
+    Strict(AndroidPrimaryResolver),
+    Compatibility(FallbackResolver<AndroidPrimaryResolver, HnsDohResolver>),
+}
+
+#[derive(Clone, Default)]
+struct DnsTraceRecorder {
+    events: Arc<Mutex<Vec<DnsTraceEvent>>>,
+}
+
+impl DnsTraceRecorder {
+    fn push(&self, event: DnsTraceEvent) {
+        if let Ok(mut events) = self.events.lock() {
+            events.push(event);
+        }
+    }
+
+    fn snapshot(&self) -> Vec<DnsTraceEvent> {
+        self.events
+            .lock()
+            .map(|events| events.clone())
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DnsTraceEvent {
+    protocol: &'static str,
+    server: String,
+    status: String,
+    error: Option<String>,
+}
+
+struct TracingDnsTransport<T> {
+    inner: T,
+    trace: DnsTraceRecorder,
+}
+
+impl<T> TracingDnsTransport<T> {
+    fn new(inner: T, trace: DnsTraceRecorder) -> Self {
+        Self { inner, trace }
+    }
+}
+
+impl<T: DnsTransport> DnsTransport for TracingDnsTransport<T> {
+    fn exchange_udp(&self, server: SocketAddr, query: &[u8]) -> Result<Vec<u8>, ResolverError> {
+        let result = self.inner.exchange_udp(server, query);
+        self.trace.push(dns_trace_event("udp53", server, &result));
+        result
+    }
+
+    fn exchange_tcp(&self, server: SocketAddr, query: &[u8]) -> Result<Vec<u8>, ResolverError> {
+        let result = self.inner.exchange_tcp(server, query);
+        self.trace.push(dns_trace_event("tcp53", server, &result));
+        result
+    }
+}
+
+fn dns_trace_event(
+    protocol: &'static str,
+    server: SocketAddr,
+    result: &Result<Vec<u8>, ResolverError>,
+) -> DnsTraceEvent {
+    match result {
+        Ok(_) => DnsTraceEvent {
+            protocol,
+            server: server.to_string(),
+            status: "ok".to_owned(),
+            error: None,
+        },
+        Err(error) => DnsTraceEvent {
+            protocol,
+            server: server.to_string(),
+            status: dns_trace_error_status(error).to_owned(),
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+fn dns_trace_error_status(error: &ResolverError) -> &'static str {
+    match error {
+        ResolverError::DnsTransport(message)
+            if message.contains("timed out")
+                || message.contains("timeout")
+                || message.contains("deadline") =>
+        {
+            "timeout"
+        }
+        ResolverError::DnsTransport(_) => "transport_error",
+        ResolverError::InvalidDnsResponse => "invalid_response",
+        ResolverError::DnssecFailed => "dnssec_failed",
+        _ => "error",
+    }
+}
+
+impl Resolver for AndroidGatewayResolver {
+    fn resolve(&self, request: &ResolutionRequest) -> Result<ResolutionAnswer, ResolverError> {
+        match self {
+            Self::Strict(resolver) => resolver.resolve(request),
+            Self::Compatibility(resolver) => resolver.resolve(request),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct FallbackMarker {
+    used: Arc<AtomicBool>,
+    reason: Arc<Mutex<Option<&'static str>>>,
+}
+
+impl FallbackMarker {
+    fn mark(&self, reason: &'static str) {
+        self.used.store(true, Ordering::Relaxed);
+        if let Ok(mut fallback_reason) = self.reason.lock() {
+            *fallback_reason = Some(reason);
+        }
+    }
+
+    fn used(&self) -> bool {
+        self.used.load(Ordering::Relaxed)
+    }
+
+    fn reason(&self) -> Option<&'static str> {
+        self.reason.lock().ok().and_then(|reason| *reason)
+    }
+}
+
 struct FallbackResolver<P, F> {
     primary: P,
     fallback: F,
-    fallback_used: Arc<AtomicBool>,
+    fallback_marker: FallbackMarker,
 }
 
 impl<P, F> FallbackResolver<P, F> {
     #[cfg(test)]
     fn new(primary: P, fallback: F) -> Self {
-        Self::with_marker(primary, fallback, Arc::new(AtomicBool::new(false)))
+        Self::with_marker(primary, fallback, FallbackMarker::default())
     }
 
-    fn with_marker(primary: P, fallback: F, fallback_used: Arc<AtomicBool>) -> Self {
+    fn with_marker(primary: P, fallback: F, fallback_marker: FallbackMarker) -> Self {
         Self {
             primary,
             fallback,
-            fallback_used,
+            fallback_marker,
         }
     }
 }
@@ -243,8 +408,9 @@ where
     fn resolve(&self, request: &ResolutionRequest) -> Result<ResolutionAnswer, ResolverError> {
         match self.primary.resolve(request) {
             Ok(answer) => Ok(answer),
-            Err(error) if should_try_doh_fallback(&error) => {
-                self.fallback_used.store(true, Ordering::Relaxed);
+            Err(error) if doh_fallback_reason(&error).is_some() => {
+                self.fallback_marker
+                    .mark(doh_fallback_reason(&error).expect("fallback reason checked"));
                 self.fallback.resolve(request)
             }
             Err(error) => Err(error),
@@ -308,14 +474,14 @@ impl Resolver for HnsDohResolver {
     }
 }
 
-fn should_try_doh_fallback(error: &ResolverError) -> bool {
-    matches!(
-        error,
-        ResolverError::NoNameserverAddress
-            | ResolverError::DnsTransport(_)
-            | ResolverError::InvalidDnsResponse
-            | ResolverError::DnssecFailed
-    )
+fn doh_fallback_reason(error: &ResolverError) -> Option<&'static str> {
+    match error {
+        ResolverError::NoNameserverAddress => Some("no_verified_nameserver_address"),
+        ResolverError::DnsTransport(_) => Some("authoritative_nameserver_transport_failed"),
+        ResolverError::InvalidDnsResponse => Some("authoritative_nameserver_invalid_response"),
+        ResolverError::DnssecFailed => Some("delegated_dnssec_validation_failed"),
+        _ => None,
+    }
 }
 
 fn next_doh_query_id() -> u16 {
@@ -383,11 +549,12 @@ fn doh_answer_from_body(
 }
 
 pub fn core_version() -> &'static str {
-    "hns-browser-rust-core/0.1.5"
+    "hns-browser-rust-core/0.1.6"
 }
 
-pub fn diagnostics_json() -> &'static str {
+pub fn diagnostics_json() -> String {
     r#"{"core":"hns-browser-rust-core","version":"0.1.5","features":["header-hash","header-pow-validation","header-mainnet-difficulty-retarget","header-canonical-height-index","hns-name-hash","hns-dotted-root-label","urkel-proof-verification","urkel-proof-value-handoff","hns-name-state-resource-extraction","hns-resource-decoder","hns-resource-provider-adapter","hns-memory-resource-provider","hns-sqlite-resource-provider","hns-negative-cache","hns-ttl-cache-lru","hns-resource-cache-stats","hns-resource-cache-eviction","hns-resource-cache-cap-enforcement","hns-resource-cache-chain-anchors","hns-resource-cache-reorg-invalidation","hns-resource-cache-current-tip","hns-proof-backed-resolver-boundary","hns-delegating-resolver-boundary","hns-proof-backed-ns-address-hydration","hns-authoritative-dnssec-delegated-resolver","android-hns-doh-compat-resolver","dns-wire","dns-svcb-https","dnssec-ds-dnskey-link","dnssec-ds-sha1","dnssec-ds-sha384","dnssec-rrsig-signed-data","dnssec-canonical-name-rdata","dnssec-ecdsa-p256-verify","dnssec-ecdsa-p384-verify","dnssec-rsa-sha1-verify","dnssec-rsa-sha256-sha512-verify","dnssec-ed25519-verify","dnssec-signed-rrset-validation","dnssec-delegated-chain-validation","dnssec-delegated-no-data-validation","dnssec-delegated-name-error-validation","dnssec-delegated-cname-chain","dnssec-child-referral-validation","dnssec-child-cname-chain","dnssec-child-no-data-validation","dnssec-child-name-error-validation","dnssec-nsec-denial-validation","dnssec-nsec3-denial-validation","dnssec-nxdomain-name-error-validation","dane-policy","dane-certificate-chain-policy","x509-spki-extraction","p2p-codec","p2p-tcp-peer-connection","p2p-static-peer-source","p2p-dns-seed-source","p2p-getaddr-peer-discovery","p2p-discovery-rotation","p2p-peer-diversity","p2p-sqlite-peer-store","sync-coordinator","sync-header-runner","sync-multi-batch-header-runner","sync-proof-scheduler","android-native-sync-once","android-sync-status","android-sync-outcome-status","android-sync-progress-heights","android-sync-high-batch-catchup","android-clear-resolver-cache","android-persistent-gateway-resolver","android-gateway-live-proof-fetch","android-gateway-header-forwarding","android-gateway-range-forwarding","android-gateway-body-forwarding","android-gateway-file-body-stream","android-webview-hns-intercept","android-service-worker-hns-intercept","android-hns-redirect-follow","android-actionable-hns-errors","hns-name-not-found-error","gateway-policy","gateway-hns-address-required","gateway-tlsa-service-scope","gateway-delegated-origin-address-lookup","gateway-origin-address-query","gateway-https-service-query","gateway-svcb-alpn-policy","gateway-actionable-nameserver-errors","gateway-cname-address-routing","android-proxy-gateway-hook","android-random-loopback-proxy-port","android-local-hns-connect-certs","hns-websocket-upgrade-fail-closed","http-origin-transport","http2-origin-transport","http3-origin-transport","http-origin-response-framing","https-rustls-transport","dane-tls-policy"],"securityDefault":"fail-closed"}"#
+    .replace("\"version\":\"0.1.5\"", "\"version\":\"0.1.6\"")
 }
 
 pub fn sync_once(data_dir: &str) -> String {
@@ -482,11 +649,13 @@ fn sync_once_with_options(
 }
 
 pub fn gateway_http_response(input: GatewayHttpRequestInput<'_>) -> Vec<u8> {
-    let headers = match parse_gateway_headers(input.header_text) {
+    let parsed_headers = match parse_gateway_headers(input.header_text) {
         Ok(headers) => headers,
         Err(error) => return plain_response_for_request(&input, 400, "Bad Request", error),
     };
-    let request = gateway_request(&input, headers);
+    let mode = GatewayResolutionMode::from_strict_hns_mode(parsed_headers.strict_hns_mode);
+    let request = gateway_request(&input, parsed_headers.headers);
+    let dns_trace = DnsTraceRecorder::default();
 
     let base = Path::new(input.data_dir).join("hns");
     if let Err(error) = fs::create_dir_all(&base) {
@@ -508,14 +677,13 @@ pub fn gateway_http_response(input: GatewayHttpRequestInput<'_>) -> Vec<u8> {
             );
         }
     };
-    let fallback_used = Arc::new(AtomicBool::new(false));
-    let resolver = FallbackResolver::with_marker(
-        DelegatingResolver::new(
-            GatewayProofProvider::new(base.clone(), values),
-            AuthoritativeDnssecResolver::default(),
-        ),
-        HnsDohResolver::default(),
-        Arc::clone(&fallback_used),
+    let fallback_marker = FallbackMarker::default();
+    let resolver = android_gateway_resolver(
+        base.clone(),
+        values,
+        mode,
+        fallback_marker.clone(),
+        dns_trace.clone(),
     );
     let gateway = match Gateway::new(
         GatewayConfig {
@@ -538,14 +706,34 @@ pub fn gateway_http_response(input: GatewayHttpRequestInput<'_>) -> Vec<u8> {
 
     match gateway.handle(&request) {
         Ok(response) => {
-            let resolver_policy = fallback_used
-                .load(Ordering::Relaxed)
-                .then_some("hns-doh-compat");
-            origin_response_with_resolver_policy(response.origin, resolver_policy)
+            let resolver_policy = fallback_marker.used().then_some("hns-doh-compat");
+            let trace = resolution_trace_json(
+                &input,
+                mode,
+                Some(&response.resolution),
+                TlsTraceInput {
+                    validation: Some(&response.origin_request.tls),
+                    decision: Some(&response.origin.dane_decision),
+                    inspection: response.origin.tls_inspection.as_ref(),
+                },
+                None,
+                &fallback_marker,
+                &dns_trace,
+            );
+            origin_response_with_resolver_policy_and_trace(response.origin, resolver_policy, &trace)
         }
         Err(error) => {
             let (status, reason, detail) = map_gateway_error(&error);
-            plain_response_for_request(&input, status, reason, detail)
+            let trace = resolution_trace_json(
+                &input,
+                mode,
+                None,
+                TlsTraceInput::default(),
+                Some(&error),
+                &fallback_marker,
+                &dns_trace,
+            );
+            plain_response_for_request_with_trace(&input, status, reason, detail, &trace)
         }
     }
 }
@@ -554,7 +742,7 @@ pub fn gateway_http_response_body_to_file(
     input: GatewayHttpRequestInput<'_>,
     body_path: &Path,
 ) -> Result<Vec<u8>, String> {
-    let headers = match parse_gateway_headers(input.header_text) {
+    let parsed_headers = match parse_gateway_headers(input.header_text) {
         Ok(headers) => headers,
         Err(error) => {
             return plain_response_to_file_for_request(
@@ -566,7 +754,9 @@ pub fn gateway_http_response_body_to_file(
             );
         }
     };
-    let request = gateway_request(&input, headers);
+    let mode = GatewayResolutionMode::from_strict_hns_mode(parsed_headers.strict_hns_mode);
+    let request = gateway_request(&input, parsed_headers.headers);
+    let dns_trace = DnsTraceRecorder::default();
 
     let base = Path::new(input.data_dir).join("hns");
     if let Err(error) = fs::create_dir_all(&base) {
@@ -590,14 +780,13 @@ pub fn gateway_http_response_body_to_file(
             );
         }
     };
-    let fallback_used = Arc::new(AtomicBool::new(false));
-    let resolver = FallbackResolver::with_marker(
-        DelegatingResolver::new(
-            GatewayProofProvider::new(base.clone(), values),
-            AuthoritativeDnssecResolver::default(),
-        ),
-        HnsDohResolver::default(),
-        Arc::clone(&fallback_used),
+    let fallback_marker = FallbackMarker::default();
+    let resolver = android_gateway_resolver(
+        base.clone(),
+        values,
+        mode,
+        fallback_marker.clone(),
+        dns_trace.clone(),
     );
     let gateway = match Gateway::new(
         GatewayConfig {
@@ -627,17 +816,40 @@ pub fn gateway_http_response_body_to_file(
         fs::File::create(body_path).map_err(|error| format!("create response body: {error}"))?;
     match gateway.handle_to_writer(&request, &mut body_file) {
         Ok(response) => {
-            let resolver_policy = fallback_used
-                .load(Ordering::Relaxed)
-                .then_some("hns-doh-compat");
-            Ok(origin_response_head_with_resolver_policy(
+            let resolver_policy = fallback_marker.used().then_some("hns-doh-compat");
+            let trace = resolution_trace_json(
+                &input,
+                mode,
+                Some(&response.resolution),
+                TlsTraceInput {
+                    validation: Some(&response.origin_request.tls),
+                    decision: Some(&response.origin.dane_decision),
+                    inspection: response.origin.tls_inspection.as_ref(),
+                },
+                None,
+                &fallback_marker,
+                &dns_trace,
+            );
+            Ok(origin_response_head_with_resolver_policy_and_trace(
                 response.origin,
                 resolver_policy,
+                &trace,
             ))
         }
         Err(error) => {
             let (status, reason, detail) = map_gateway_error(&error);
-            plain_response_to_file_for_request(&input, status, reason, detail, body_path)
+            let trace = resolution_trace_json(
+                &input,
+                mode,
+                None,
+                TlsTraceInput::default(),
+                Some(&error),
+                &fallback_marker,
+                &dns_trace,
+            );
+            plain_response_to_file_for_request_with_trace(
+                &input, status, reason, detail, body_path, &trace,
+            )
         }
     }
 }
@@ -670,12 +882,35 @@ fn gateway_request(
     }
 }
 
-fn parse_gateway_headers(header_text: &str) -> Result<Vec<(String, String)>, &'static str> {
+fn android_gateway_resolver(
+    base: PathBuf,
+    values: SqliteResourceValueProvider,
+    mode: GatewayResolutionMode,
+    fallback_marker: FallbackMarker,
+    dns_trace: DnsTraceRecorder,
+) -> AndroidGatewayResolver {
+    let primary = DelegatingResolver::new(
+        GatewayProofProvider::new(base, values),
+        AuthoritativeDnssecResolver::new(
+            TracingDnsTransport::new(UdpTcpDnsTransport::default(), dns_trace),
+            SystemDnssecVerifier,
+        ),
+    );
+    match mode {
+        GatewayResolutionMode::Strict => AndroidGatewayResolver::Strict(primary),
+        GatewayResolutionMode::Compatibility => AndroidGatewayResolver::Compatibility(
+            FallbackResolver::with_marker(primary, HnsDohResolver::default(), fallback_marker),
+        ),
+    }
+}
+
+fn parse_gateway_headers(header_text: &str) -> Result<ParsedGatewayHeaders, &'static str> {
     if header_text.len() > MAX_GATEWAY_HEADER_TEXT_BYTES {
         return Err("request headers are too large");
     }
 
     let mut headers = Vec::new();
+    let mut strict_hns_mode = false;
     for line in header_text.split("\r\n").filter(|line| !line.is_empty()) {
         let Some(separator) = line.find(':') else {
             return Err("request header is malformed");
@@ -690,38 +925,59 @@ fn parse_gateway_headers(header_text: &str) -> Result<Vec<(String, String)>, &'s
         {
             return Err("request header is invalid");
         }
+        if name.eq_ignore_ascii_case(HNS_GATEWAY_STRICT_MODE_HEADER) {
+            if value == "1" || value.eq_ignore_ascii_case("true") {
+                strict_hns_mode = true;
+            }
+            continue;
+        }
         headers.push((name.to_owned(), value.to_owned()));
     }
 
-    Ok(headers)
+    Ok(ParsedGatewayHeaders {
+        headers,
+        strict_hns_mode,
+    })
 }
 
 #[cfg(test)]
 fn origin_response(response: OriginResponse) -> Vec<u8> {
-    origin_response_with_resolver_policy(response, None)
+    origin_response_with_resolver_policy_and_trace(response, None, "{}")
 }
 
-fn origin_response_with_resolver_policy(
+fn origin_response_with_resolver_policy_and_trace(
     response: OriginResponse,
     resolver_policy: Option<&str>,
+    trace_json: &str,
 ) -> Vec<u8> {
     let body = response.body;
-    let mut out = origin_response_head_with_resolver_policy(
+    let mut out = origin_response_head_with_resolver_policy_and_trace(
         OriginResponseHead {
             status: response.status,
             headers: response.headers,
             body_len: body.len(),
             dane_decision: response.dane_decision,
+            tls_inspection: response.tls_inspection,
         },
         resolver_policy,
+        trace_json,
     );
     out.extend(body);
     out
 }
 
-fn origin_response_head_with_resolver_policy(
+#[cfg(test)]
+fn origin_response_with_resolver_policy(
+    response: OriginResponse,
+    resolver_policy: Option<&str>,
+) -> Vec<u8> {
+    origin_response_with_resolver_policy_and_trace(response, resolver_policy, "{}")
+}
+
+fn origin_response_head_with_resolver_policy_and_trace(
     response: OriginResponseHead,
     resolver_policy: Option<&str>,
+    trace_json: &str,
 ) -> Vec<u8> {
     let mut out = response_head(response.status, "OK", None, response.body_len);
     for (name, value) in response.headers {
@@ -736,6 +992,15 @@ fn origin_response_head_with_resolver_policy(
     if let Some(policy) = resolver_policy {
         out.extend(format!("X-HNS-Resolver-Policy: {policy}\r\n").as_bytes());
     }
+    out.extend(format!("{HNS_RESOLVER_MODE_HEADER}: {}\r\n", trace_mode(trace_json)).as_bytes());
+    out.extend(
+        format!(
+            "{HNS_DOH_FALLBACK_HEADER}: {}\r\n",
+            trace_doh_fallback(trace_json)
+        )
+        .as_bytes(),
+    );
+    out.extend(format!("{HNS_RESOLUTION_TRACE_HEADER}: {trace_json}\r\n").as_bytes());
     out.extend(b"\r\n");
     out
 }
@@ -745,6 +1010,727 @@ fn suppressed_origin_response_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("content-length")
         || name.eq_ignore_ascii_case("transfer-encoding")
         || name.eq_ignore_ascii_case("trailer")
+        || name.eq_ignore_ascii_case("x-hns-tls-policy")
+        || name.eq_ignore_ascii_case("x-hns-resolver-policy")
+        || name.eq_ignore_ascii_case(HNS_RESOLUTION_TRACE_HEADER)
+        || name.eq_ignore_ascii_case(HNS_RESOLVER_MODE_HEADER)
+        || name.eq_ignore_ascii_case(HNS_DOH_FALLBACK_HEADER)
+}
+
+#[derive(Clone, Copy, Default)]
+struct TlsTraceInput<'a> {
+    validation: Option<&'a TlsValidation>,
+    decision: Option<&'a DaneDecision>,
+    inspection: Option<&'a TlsCertificateInspection>,
+}
+
+fn resolution_trace_json(
+    input: &GatewayHttpRequestInput<'_>,
+    mode: GatewayResolutionMode,
+    resolution: Option<&ResolutionAnswer>,
+    tls: TlsTraceInput<'_>,
+    error: Option<&GatewayError>,
+    fallback_marker: &FallbackMarker,
+    dns_trace: &DnsTraceRecorder,
+) -> String {
+    let resource_types = resolution
+        .map(|answer| {
+            answer
+                .records
+                .iter()
+                .map(|record| record_type_name(&record.record_type))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .map(|record_type| format!(r#""{}""#, json_escape(record_type)))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    let delegation = resolution
+        .map(|answer| {
+            answer.records.iter().any(|record| {
+                matches!(
+                    record.record_type,
+                    RecordType::Ns | RecordType::Ds | RecordType::Unknown(6)
+                )
+            })
+        })
+        .unwrap_or(false);
+    let origin_address = resolution
+        .map(|answer| {
+            answer
+                .records
+                .iter()
+                .any(|record| matches!(record.record_type, RecordType::A | RecordType::Aaaa))
+        })
+        .unwrap_or(false);
+    let hns_proof = match (resolution, error) {
+        (Some(answer), _) if answer.secure => "verified",
+        (_, Some(GatewayError::Resolver(ResolverError::ProofUnavailable))) => "unavailable",
+        (_, Some(GatewayError::Resolver(ResolverError::NameNotFound))) => "not_found",
+        (_, Some(GatewayError::Resolver(ResolverError::ProofNameMismatch))) => "failed",
+        _ => "unknown",
+    };
+    let fallback_reason = fallback_marker.reason().unwrap_or("none");
+    let fallback_type = if fallback_marker.used() {
+        r#""HNS_DOH""#
+    } else {
+        "null"
+    };
+    let fallback_reason_json = if fallback_marker.used() {
+        format!(r#""{}""#, json_escape(fallback_reason))
+    } else {
+        "null".to_owned()
+    };
+    let final_error = error
+        .map(|error| format!(r#""{}""#, json_escape(&error.to_string())))
+        .unwrap_or_else(|| "null".to_owned());
+    let dns_events = dns_trace.snapshot();
+    let authoritative_dns = authoritative_dns_trace_json(&dns_events);
+    let dns_attempts = dns_trace_attempts_json(&dns_events);
+
+    format!(
+        r#"{{"host":"{}","url":"{}","root":"{}","mode":"{}","hnsProof":"{}","delegation":{},"resourceRecords":[{}],"nameserverCandidates":{},"authoritativeDns":{},"dnssec":"{}","originAddress":"{}","tls":{},"fallback":{{"used":{},"type":{},"reason":{}}},"dnsAttempts":[{}],"finalError":{}}}"#,
+        json_escape(input.host),
+        json_escape(&gateway_request_address(input)),
+        json_escape(&hns_trace_root(input.host)),
+        mode.as_str(),
+        hns_proof,
+        delegation,
+        resource_types,
+        nameserver_candidates_json(&dns_events),
+        authoritative_dns,
+        dnssec_trace_status(resolution, error),
+        if origin_address { "found" } else { "missing" },
+        tls_trace_json(input, tls.validation, tls.decision, tls.inspection, error),
+        fallback_marker.used(),
+        fallback_type,
+        fallback_reason_json,
+        dns_attempts,
+        final_error,
+    )
+}
+
+fn authoritative_dns_trace_json(events: &[DnsTraceEvent]) -> String {
+    format!(
+        r#"{{"udp53":"{}","tcp53":"{}"}}"#,
+        dns_protocol_status(events, "udp53"),
+        dns_protocol_status(events, "tcp53"),
+    )
+}
+
+fn tls_trace_json(
+    input: &GatewayHttpRequestInput<'_>,
+    tls_validation: Option<&TlsValidation>,
+    dane_decision: Option<&DaneDecision>,
+    tls_inspection: Option<&TlsCertificateInspection>,
+    error: Option<&GatewayError>,
+) -> String {
+    if !input.scheme.eq_ignore_ascii_case("https")
+        && tls_validation
+            .map(|tls| tls.tlsa_records.is_empty())
+            .unwrap_or(true)
+        && dane_decision.is_none()
+    {
+        return "null".to_owned();
+    }
+
+    let owner = tlsa_owner_name(input.host, input.port);
+    let records = tls_validation
+        .map(|tls| tlsa_records_json(&tls.tlsa_records))
+        .unwrap_or_else(|| "[]".to_owned());
+    let records_found = tls_validation
+        .map(|tls| !tls.tlsa_records.is_empty())
+        .unwrap_or(false);
+    let dnssec_secure = tls_validation
+        .map(|tls| if tls.dnssec_secure { "true" } else { "false" })
+        .unwrap_or("null");
+    let mode = tls_validation
+        .map(|tls| format!(r#""{}""#, json_escape(tls_mode_name(tls))))
+        .unwrap_or_else(|| "null".to_owned());
+    let decision = dane_trace_decision(dane_decision, error);
+    let matched_usage = dane_decision
+        .and_then(|decision| match decision {
+            DaneDecision::Matched(usage) => Some(format!(r#""{}""#, tlsa_usage_name(*usage))),
+            _ => None,
+        })
+        .unwrap_or_else(|| "null".to_owned());
+    let certificate_match = dane_certificate_match(dane_decision, error);
+    let fallback = matches!(dane_decision, Some(DaneDecision::WebPkiFallback));
+
+    format!(
+        r#"{{"mode":{},"tlsaOwner":"{}","tlsaFound":{},"dnssecSecure":{},"records":{},"certificate":{},"dane":{{"decision":"{}","matchedUsage":{},"certificateMatch":"{}","webPkiFallback":{}}}}}"#,
+        mode,
+        json_escape(&owner),
+        records_found,
+        dnssec_secure,
+        records,
+        tls_certificate_inspection_json(tls_inspection),
+        decision,
+        matched_usage,
+        certificate_match,
+        fallback,
+    )
+}
+
+fn tls_certificate_inspection_json(inspection: Option<&TlsCertificateInspection>) -> String {
+    let Some(inspection) = inspection else {
+        return "null".to_owned();
+    };
+    format!(
+        r#"{{"webPkiStatus":"{}","endEntitySha256":"{}","spkiSha256":"{}","spkiDerHex":"{}","intermediateCount":{},"intermediateSha256":[{}]}}"#,
+        webpki_status_name(inspection.webpki_status),
+        sha256_hex(&inspection.end_entity_der),
+        sha256_hex(&inspection.end_entity_spki_der),
+        hex_lower(&inspection.end_entity_spki_der),
+        inspection.intermediate_der.len(),
+        inspection
+            .intermediate_der
+            .iter()
+            .map(|certificate| format!(r#""{}""#, sha256_hex(certificate)))
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
+fn webpki_status_name(status: hns_dane::WebPkiStatus) -> &'static str {
+    match status {
+        hns_dane::WebPkiStatus::Valid => "valid",
+        hns_dane::WebPkiStatus::Invalid => "invalid",
+        hns_dane::WebPkiStatus::NotEvaluated => "not_evaluated",
+    }
+}
+
+fn sha256_hex(value: &[u8]) -> String {
+    hex_lower(&Sha256::digest(value))
+}
+
+fn tlsa_owner_name(host: &str, port: u16) -> String {
+    format!("_{}._tcp.{}", port, host.trim_end_matches('.'))
+}
+
+fn tls_mode_name(tls: &TlsValidation) -> &'static str {
+    match tls.mode {
+        hns_dane::DomainTrustMode::HnsStrict => "hns_strict",
+        hns_dane::DomainTrustMode::HnsCompatibility => "hns_compatibility",
+        hns_dane::DomainTrustMode::IcannWebPki => "icann_webpki",
+    }
+}
+
+fn dane_trace_decision(
+    dane_decision: Option<&DaneDecision>,
+    error: Option<&GatewayError>,
+) -> &'static str {
+    match (dane_decision, error) {
+        (Some(DaneDecision::Matched(_)), _) => "verified",
+        (Some(DaneDecision::WebPkiFallback), _) => "webpki_fallback",
+        (Some(DaneDecision::NoTlsa), _) => "no_tlsa",
+        (Some(DaneDecision::Failed), _) => "failed",
+        (_, Some(GatewayError::InvalidTlsa(_)))
+        | (_, Some(GatewayError::Transport(TransportError::DaneFailed))) => "failed",
+        _ => "not_evaluated",
+    }
+}
+
+fn dane_certificate_match(
+    dane_decision: Option<&DaneDecision>,
+    error: Option<&GatewayError>,
+) -> &'static str {
+    match (dane_decision, error) {
+        (Some(DaneDecision::Matched(_)), _) => "pass",
+        (Some(DaneDecision::WebPkiFallback), _) => "webpki_valid",
+        (Some(DaneDecision::NoTlsa), _) => "not_checked",
+        (Some(DaneDecision::Failed), _) => "failed",
+        (_, Some(GatewayError::InvalidTlsa(_)))
+        | (_, Some(GatewayError::Transport(TransportError::DaneFailed))) => "failed",
+        _ => "unknown",
+    }
+}
+
+fn tlsa_records_json(records: &[TlsaRecord]) -> String {
+    format!(
+        "[{}]",
+        records
+            .iter()
+            .map(tlsa_record_json)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn tlsa_record_json(record: &TlsaRecord) -> String {
+    format!(
+        r#"{{"usage":"{}","selector":"{}","matching":"{}","associationDataHex":"{}"}}"#,
+        tlsa_usage_name(record.usage),
+        tlsa_selector_name(record.selector),
+        tlsa_matching_name(record.matching),
+        hex_lower(&record.association_data),
+    )
+}
+
+fn tlsa_usage_name(usage: TlsaUsage) -> &'static str {
+    match usage {
+        TlsaUsage::PkixTa => "PKIX-TA",
+        TlsaUsage::PkixEe => "PKIX-EE",
+        TlsaUsage::DaneTa => "DANE-TA",
+        TlsaUsage::DaneEe => "DANE-EE",
+    }
+}
+
+fn tlsa_selector_name(selector: TlsaSelector) -> &'static str {
+    match selector {
+        TlsaSelector::FullCertificate => "Cert",
+        TlsaSelector::SubjectPublicKeyInfo => "SPKI",
+    }
+}
+
+fn tlsa_matching_name(matching: TlsaMatching) -> &'static str {
+    match matching {
+        TlsaMatching::Exact => "Exact",
+        TlsaMatching::Sha256 => "SHA-256",
+        TlsaMatching::Sha512 => "SHA-512",
+    }
+}
+
+fn dns_protocol_status(events: &[DnsTraceEvent], protocol: &str) -> String {
+    let statuses = events
+        .iter()
+        .filter(|event| event.protocol == protocol)
+        .map(|event| event.status.as_str())
+        .collect::<Vec<_>>();
+    if statuses.is_empty() {
+        return "not_attempted".to_owned();
+    }
+    if statuses.contains(&"ok") {
+        return "ok".to_owned();
+    }
+    if statuses.contains(&"timeout") {
+        return "timeout".to_owned();
+    }
+    statuses.last().copied().unwrap_or("error").to_owned()
+}
+
+fn dns_trace_attempts_json(events: &[DnsTraceEvent]) -> String {
+    events
+        .iter()
+        .map(|event| {
+            let error = event
+                .error
+                .as_ref()
+                .map(|error| format!(r#""{}""#, json_escape(error)))
+                .unwrap_or_else(|| "null".to_owned());
+            format!(
+                r#"{{"protocol":"{}","server":"{}","status":"{}","error":{}}}"#,
+                event.protocol,
+                json_escape(&event.server),
+                json_escape(&event.status),
+                error,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn nameserver_candidates_json(events: &[DnsTraceEvent]) -> String {
+    let servers = events
+        .iter()
+        .map(|event| event.server.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    format!(
+        "[{}]",
+        servers
+            .into_iter()
+            .map(|server| format!(r#""{}""#, json_escape(server)))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn dnssec_trace_status(
+    resolution: Option<&ResolutionAnswer>,
+    error: Option<&GatewayError>,
+) -> &'static str {
+    if matches!(
+        error,
+        Some(GatewayError::Resolver(ResolverError::DnssecFailed))
+    ) {
+        "bogus"
+    } else if resolution.map(|answer| answer.secure).unwrap_or(false) {
+        "secure"
+    } else if resolution.is_some() {
+        "unsigned"
+    } else {
+        "unknown"
+    }
+}
+
+fn hns_trace_root(host: &str) -> String {
+    host.trim()
+        .trim_end_matches('.')
+        .rsplit('.')
+        .next()
+        .unwrap_or(host)
+        .to_owned()
+}
+
+fn hns_proof_details(data_dir: &str, host_or_url: &str) -> String {
+    let (host, root_name) = match hns_proof_host_and_root(host_or_url) {
+        Ok(value) => value,
+        Err(error) => return hns_proof_details_error_json(host_or_url, &error),
+    };
+    let name_hash = match NameHash::from_name(&root_name) {
+        Ok(value) => value,
+        Err(error) => {
+            return hns_proof_details_base_json(HnsProofDetailsJson {
+                host: &host,
+                root_name: &root_name,
+                name_hash: None,
+                proof_status: "failed",
+                cache_status: "invalid_name",
+                anchor: None,
+                secure: None,
+                exists: None,
+                records: Vec::new(),
+                raw_resource: None,
+                current_tip_base: None,
+                error: &format!("invalid HNS name: {error}"),
+            });
+        }
+    };
+
+    let base = Path::new(data_dir).join("hns");
+    let resources_path = base.join("resources.sqlite");
+    if !resources_path.exists() {
+        return hns_proof_details_base_json(HnsProofDetailsJson {
+            host: &host,
+            root_name: &root_name,
+            name_hash: Some(name_hash),
+            proof_status: "unavailable",
+            cache_status: "resource_cache_missing",
+            anchor: None,
+            secure: None,
+            exists: None,
+            records: Vec::new(),
+            raw_resource: None,
+            current_tip_base: Some(&base),
+            error: "resource cache is not initialized",
+        });
+    }
+
+    let provider = match SqliteResourceValueProvider::open(resources_path) {
+        Ok(value) => value,
+        Err(error) => {
+            return hns_proof_details_base_json(HnsProofDetailsJson {
+                host: &host,
+                root_name: &root_name,
+                name_hash: Some(name_hash),
+                proof_status: "error",
+                cache_status: "resource_cache_open_failed",
+                anchor: None,
+                secure: None,
+                exists: None,
+                records: Vec::new(),
+                raw_resource: None,
+                current_tip_base: Some(&base),
+                error: &format!("open resource cache: {error}"),
+            });
+        }
+    };
+
+    let verified = match provider.prove_resource_value(&root_name, name_hash) {
+        Ok(value) => value,
+        Err(ResolverError::ProofUnavailable) => {
+            return hns_proof_details_base_json(HnsProofDetailsJson {
+                host: &host,
+                root_name: &root_name,
+                name_hash: Some(name_hash),
+                proof_status: "unavailable",
+                cache_status: "not_cached",
+                anchor: None,
+                secure: None,
+                exists: None,
+                records: Vec::new(),
+                raw_resource: None,
+                current_tip_base: Some(&base),
+                error: "no cached proof is available for this HNS root",
+            });
+        }
+        Err(error) => {
+            return hns_proof_details_base_json(HnsProofDetailsJson {
+                host: &host,
+                root_name: &root_name,
+                name_hash: Some(name_hash),
+                proof_status: "error",
+                cache_status: "proof_read_failed",
+                anchor: None,
+                secure: None,
+                exists: None,
+                records: Vec::new(),
+                raw_resource: None,
+                current_tip_base: Some(&base),
+                error: &error.to_string(),
+            });
+        }
+    };
+
+    let raw_resource = verified.value.as_deref();
+    let records = match ProvenNameRecords::from_verified_resource_value(verified.clone()) {
+        Ok(proven) => proven.records,
+        Err(error) => {
+            return hns_proof_details_base_json(HnsProofDetailsJson {
+                host: &host,
+                root_name: &root_name,
+                name_hash: Some(name_hash),
+                proof_status: "invalid_resource",
+                cache_status: &proof_cache_status(&base, verified.anchor),
+                anchor: verified.anchor,
+                secure: Some(verified.secure),
+                exists: Some(verified.value.is_some()),
+                records: Vec::new(),
+                raw_resource,
+                current_tip_base: Some(&base),
+                error: &format!("decode resource records: {error}"),
+            });
+        }
+    };
+    let status = match (verified.secure, verified.value.is_some()) {
+        (false, _) => "failed",
+        (true, false) => "not_found",
+        (true, true) => "verified",
+    };
+
+    hns_proof_details_base_json(HnsProofDetailsJson {
+        host: &host,
+        root_name: &root_name,
+        name_hash: Some(name_hash),
+        proof_status: status,
+        cache_status: &proof_cache_status(&base, verified.anchor),
+        anchor: verified.anchor,
+        secure: Some(verified.secure),
+        exists: Some(verified.value.is_some()),
+        records,
+        raw_resource,
+        current_tip_base: Some(&base),
+        error: "",
+    })
+}
+
+fn hns_proof_host_and_root(host_or_url: &str) -> Result<(String, String), String> {
+    let mut value = host_or_url.trim();
+    if let Some(rest) = value.strip_prefix("https://") {
+        value = rest;
+    } else if let Some(rest) = value.strip_prefix("http://") {
+        value = rest;
+    }
+    let authority = value
+        .split(&['/', '?', '#'][..])
+        .next()
+        .unwrap_or(value)
+        .trim();
+    let host = match authority.rsplit_once(':') {
+        Some((host, port)) if port.bytes().all(|byte| byte.is_ascii_digit()) => host,
+        _ => authority,
+    }
+    .trim_end_matches('.')
+    .to_ascii_lowercase();
+    if host.is_empty() {
+        return Err("missing HNS host".to_owned());
+    }
+    let root = hns_trace_root(&host).to_ascii_lowercase();
+    if root.is_empty() {
+        return Err("missing HNS root".to_owned());
+    }
+    Ok((host, root))
+}
+
+fn hns_proof_details_error_json(host_or_url: &str, error: &str) -> String {
+    format!(
+        r#"{{"host":"{}","name":null,"nameHash":null,"hnsProof":"error","proofStatus":"error","secure":null,"exists":null,"treeRoot":null,"blockHeight":null,"cacheStatus":"invalid_input","resourceValueHex":null,"recordTypes":[],"resourceRecords":[],"currentTip":null,"error":"{}"}}"#,
+        json_escape(host_or_url),
+        json_escape(error),
+    )
+}
+
+struct HnsProofDetailsJson<'a> {
+    host: &'a str,
+    root_name: &'a str,
+    name_hash: Option<NameHash>,
+    proof_status: &'a str,
+    cache_status: &'a str,
+    anchor: Option<ResourceValueAnchor>,
+    secure: Option<bool>,
+    exists: Option<bool>,
+    records: Vec<ResourceRecord>,
+    raw_resource: Option<&'a [u8]>,
+    current_tip_base: Option<&'a Path>,
+    error: &'a str,
+}
+
+fn hns_proof_details_base_json(details: HnsProofDetailsJson<'_>) -> String {
+    let name_hash = details
+        .name_hash
+        .map(|value| format!(r#""{}""#, value.as_hash()))
+        .unwrap_or_else(|| "null".to_owned());
+    let tree_root = details
+        .anchor
+        .map(|value| format!(r#""{}""#, value.tree_root))
+        .unwrap_or_else(|| "null".to_owned());
+    let block_height = details
+        .anchor
+        .map(|value| value.height.0.to_string())
+        .unwrap_or_else(|| "null".to_owned());
+    let secure = json_bool_or_null(details.secure);
+    let exists = json_bool_or_null(details.exists);
+    let raw_resource = details
+        .raw_resource
+        .map(|value| format!(r#""{}""#, hex_lower(value)))
+        .unwrap_or_else(|| "null".to_owned());
+    let record_types = record_types_json(&details.records);
+    let records_json = resource_records_json(&details.records);
+    let current_tip = details
+        .current_tip_base
+        .map(current_tip_json)
+        .unwrap_or_else(|| "null".to_owned());
+    let error = if details.error.is_empty() {
+        "null".to_owned()
+    } else {
+        format!(r#""{}""#, json_escape(details.error))
+    };
+
+    format!(
+        r#"{{"host":"{}","name":"{}","nameHash":{},"hnsProof":"{}","proofStatus":"{}","secure":{},"exists":{},"treeRoot":{},"blockHeight":{},"cacheStatus":"{}","resourceValueHex":{},"recordTypes":{},"resourceRecords":{},"currentTip":{},"error":{}}}"#,
+        json_escape(details.host),
+        json_escape(details.root_name),
+        name_hash,
+        json_escape(details.proof_status),
+        json_escape(details.proof_status),
+        secure,
+        exists,
+        tree_root,
+        block_height,
+        json_escape(details.cache_status),
+        raw_resource,
+        record_types,
+        records_json,
+        current_tip,
+        error,
+    )
+}
+
+fn proof_cache_status(base: &Path, anchor: Option<ResourceValueAnchor>) -> String {
+    match (anchor, best_synced_header(base).ok()) {
+        (None, _) => "no_anchor".to_owned(),
+        (Some(anchor), Some(best))
+            if anchor.height == best.height && anchor.tree_root == best.header.tree_root =>
+        {
+            "anchored_to_current_tip".to_owned()
+        }
+        (Some(_), Some(_)) => "anchored_to_height".to_owned(),
+        (Some(_), None) => "anchored_no_current_tip".to_owned(),
+    }
+}
+
+fn current_tip_json(base: &Path) -> String {
+    match best_synced_header(base) {
+        Ok(best) => format!(
+            r#"{{"height":{},"treeRoot":"{}"}}"#,
+            best.height.0, best.header.tree_root,
+        ),
+        Err(_) => "null".to_owned(),
+    }
+}
+
+fn json_bool_or_null(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "null",
+    }
+}
+
+fn record_types_json(records: &[ResourceRecord]) -> String {
+    let values = records
+        .iter()
+        .map(|record| record_type_name(&record.record_type))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|record_type| format!(r#""{}""#, json_escape(record_type)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{values}]")
+}
+
+fn resource_records_json(records: &[ResourceRecord]) -> String {
+    format!(
+        "[{}]",
+        records
+            .iter()
+            .map(resource_record_json)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn resource_record_json(record: &ResourceRecord) -> String {
+    format!(
+        r#"{{"name":"{}","type":"{}","class":{},"ttl":{},"rdataHex":"{}"}}"#,
+        json_escape(&record.name.to_string()),
+        json_escape(record_type_name(&record.record_type)),
+        record.class,
+        record.ttl,
+        hex_lower(&record.rdata),
+    )
+}
+
+fn hex_lower(value: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(value.len() * 2);
+    for byte in value {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn record_type_name(record_type: &RecordType) -> &'static str {
+    match record_type {
+        RecordType::A => "A",
+        RecordType::Aaaa => "AAAA",
+        RecordType::Ns => "NS",
+        RecordType::Ds => "DS",
+        RecordType::Txt => "TXT",
+        RecordType::Soa => "SOA",
+        RecordType::Srv => "SRV",
+        RecordType::Rrsig => "RRSIG",
+        RecordType::Nsec => "NSEC",
+        RecordType::Dnskey => "DNSKEY",
+        RecordType::Nsec3 => "NSEC3",
+        RecordType::Tlsa => "TLSA",
+        RecordType::Svcb => "SVCB",
+        RecordType::Https => "HTTPS",
+        RecordType::Cname => "CNAME",
+        RecordType::Unknown(1) => "GLUE4",
+        RecordType::Unknown(2) => "GLUE6",
+        RecordType::Unknown(6) => "SYNTH4",
+        RecordType::Unknown(7) => "SYNTH6",
+        RecordType::Unknown(_) => "UNKNOWN",
+    }
+}
+
+fn trace_mode(trace_json: &str) -> &'static str {
+    if trace_json.contains(r#""mode":"strict""#) {
+        "strict"
+    } else {
+        "compatibility"
+    }
+}
+
+fn trace_doh_fallback(trace_json: &str) -> &'static str {
+    if trace_json.contains(r#""used":true"#) {
+        "yes"
+    } else {
+        "no"
+    }
 }
 
 fn hns_tls_policy_header(decision: &DaneDecision) -> Option<&'static str> {
@@ -912,11 +1898,48 @@ fn plain_response_for_request(
     plain_response_with_address(status, reason, detail, Some(&address))
 }
 
+fn plain_response_for_request_with_trace(
+    input: &GatewayHttpRequestInput<'_>,
+    status: u16,
+    reason: &str,
+    detail: &str,
+    trace_json: &str,
+) -> Vec<u8> {
+    let address = gateway_request_address(input);
+    plain_response_with_address_and_trace(status, reason, detail, Some(&address), trace_json)
+}
+
 fn plain_response_with_address(
     status: u16,
     reason: &str,
     detail: &str,
     address: Option<&str>,
+) -> Vec<u8> {
+    plain_response_with_address_and_optional_trace(status, reason, detail, address, None)
+}
+
+fn plain_response_with_address_and_trace(
+    status: u16,
+    reason: &str,
+    detail: &str,
+    address: Option<&str>,
+    trace_json: &str,
+) -> Vec<u8> {
+    plain_response_with_address_and_optional_trace(
+        status,
+        reason,
+        detail,
+        address,
+        Some(trace_json),
+    )
+}
+
+fn plain_response_with_address_and_optional_trace(
+    status: u16,
+    reason: &str,
+    detail: &str,
+    address: Option<&str>,
+    trace_json: Option<&str>,
 ) -> Vec<u8> {
     let body = plain_response_body(status, reason, detail, address);
     let mut out = response_head(
@@ -925,6 +1948,19 @@ fn plain_response_with_address(
         Some("text/plain; charset=utf-8"),
         body.len(),
     );
+    if let Some(trace_json) = trace_json {
+        out.extend(
+            format!("{HNS_RESOLVER_MODE_HEADER}: {}\r\n", trace_mode(trace_json)).as_bytes(),
+        );
+        out.extend(
+            format!(
+                "{HNS_DOH_FALLBACK_HEADER}: {}\r\n",
+                trace_doh_fallback(trace_json)
+            )
+            .as_bytes(),
+        );
+        out.extend(format!("{HNS_RESOLUTION_TRACE_HEADER}: {trace_json}\r\n").as_bytes());
+    }
     out.extend(b"\r\n");
     out.extend(body);
     out
@@ -941,12 +1977,62 @@ fn plain_response_to_file_for_request(
     plain_response_to_file_with_address(status, reason, detail, Some(&address), body_path)
 }
 
+fn plain_response_to_file_for_request_with_trace(
+    input: &GatewayHttpRequestInput<'_>,
+    status: u16,
+    reason: &str,
+    detail: &str,
+    body_path: &Path,
+    trace_json: &str,
+) -> Result<Vec<u8>, String> {
+    let address = gateway_request_address(input);
+    plain_response_to_file_with_address_and_trace(
+        status,
+        reason,
+        detail,
+        Some(&address),
+        body_path,
+        trace_json,
+    )
+}
+
 fn plain_response_to_file_with_address(
     status: u16,
     reason: &str,
     detail: &str,
     address: Option<&str>,
     body_path: &Path,
+) -> Result<Vec<u8>, String> {
+    plain_response_to_file_with_address_and_optional_trace(
+        status, reason, detail, address, body_path, None,
+    )
+}
+
+fn plain_response_to_file_with_address_and_trace(
+    status: u16,
+    reason: &str,
+    detail: &str,
+    address: Option<&str>,
+    body_path: &Path,
+    trace_json: &str,
+) -> Result<Vec<u8>, String> {
+    plain_response_to_file_with_address_and_optional_trace(
+        status,
+        reason,
+        detail,
+        address,
+        body_path,
+        Some(trace_json),
+    )
+}
+
+fn plain_response_to_file_with_address_and_optional_trace(
+    status: u16,
+    reason: &str,
+    detail: &str,
+    address: Option<&str>,
+    body_path: &Path,
+    trace_json: Option<&str>,
 ) -> Result<Vec<u8>, String> {
     let body = plain_response_body(status, reason, detail, address);
     if let Some(parent) = body_path.parent() {
@@ -960,6 +2046,19 @@ fn plain_response_to_file_with_address(
         Some("text/plain; charset=utf-8"),
         body.len(),
     );
+    if let Some(trace_json) = trace_json {
+        out.extend(
+            format!("{HNS_RESOLVER_MODE_HEADER}: {}\r\n", trace_mode(trace_json)).as_bytes(),
+        );
+        out.extend(
+            format!(
+                "{HNS_DOH_FALLBACK_HEADER}: {}\r\n",
+                trace_doh_fallback(trace_json)
+            )
+            .as_bytes(),
+        );
+        out.extend(format!("{HNS_RESOLUTION_TRACE_HEADER}: {trace_json}\r\n").as_bytes());
+    }
     out.extend(b"\r\n");
     Ok(out)
 }
@@ -1713,6 +2812,25 @@ pub extern "system" fn Java_com_handshake_browser_net_NativeBridge_nativeClearRe
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_com_handshake_browser_net_NativeBridge_nativeHnsProofDetails(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    data_dir: JString<'_>,
+    host: JString<'_>,
+) -> jstring {
+    let details = match (env.get_string(&data_dir), env.get_string(&host)) {
+        (Ok(data_dir), Ok(host)) => {
+            hns_proof_details(&data_dir.to_string_lossy(), &host.to_string_lossy())
+        }
+        _ => hns_proof_details_error_json("", "invalid proof detail input"),
+    };
+
+    env.new_string(details)
+        .map(|value| value.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_com_handshake_browser_net_NativeBridge_nativeLocalTlsCertificate(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
@@ -1746,7 +2864,7 @@ mod tests {
 
     #[test]
     fn version_is_stable() {
-        assert_eq!(core_version(), "hns-browser-rust-core/0.1.5");
+        assert_eq!(core_version(), "hns-browser-rust-core/0.1.6");
     }
 
     #[test]
@@ -2147,6 +3265,58 @@ mod tests {
     }
 
     #[test]
+    fn hns_proof_details_reports_cached_resource_anchor_and_records() {
+        let path = temp_dir_path("proof-details-cached");
+        let base = path.join("hns");
+        std::fs::create_dir_all(&base).unwrap();
+        let resources = SqliteResourceValueProvider::open(base.join("resources.sqlite")).unwrap();
+        let root_name = "welcome".to_owned();
+        let name_hash = NameHash::from_name(&root_name).unwrap();
+        let anchor_root = Hash::new([8; 32]);
+        let anchor_height = store_best_header_with_tree_root(&base, anchor_root);
+        let resource = owner_glue4_resource(&root_name, [127, 0, 0, 1]);
+        resources
+            .insert(
+                VerifiedResourceValue::inclusion(root_name.clone(), name_hash, resource.clone())
+                    .with_anchor(anchor_root, anchor_height),
+            )
+            .unwrap();
+
+        let json = hns_proof_details(path.to_str().unwrap(), "www.welcome/");
+
+        assert!(json.contains(r#""host":"www.welcome""#));
+        assert!(json.contains(r#""name":"welcome""#));
+        assert!(json.contains(&format!(r#""nameHash":"{}""#, name_hash.as_hash())));
+        assert!(json.contains(r#""proofStatus":"verified""#));
+        assert!(json.contains(r#""cacheStatus":"anchored_to_current_tip""#));
+        assert!(json.contains(&format!(r#""treeRoot":"{}""#, anchor_root)));
+        assert!(json.contains(r#""blockHeight":1"#));
+        assert!(json.contains(&format!(r#""resourceValueHex":"{}""#, hex_lower(&resource))));
+        assert!(json.contains(r#""recordTypes":["A","NS"]"#));
+        assert!(json.contains(r#""type":"NS""#));
+        assert!(json.contains(r#""type":"A""#));
+        assert!(json.contains(r#""currentTip":{"height":1"#));
+
+        cleanup_dir(&path);
+    }
+
+    #[test]
+    fn hns_proof_details_reports_missing_resource_cache() {
+        let path = temp_dir_path("proof-details-missing-cache");
+
+        let json = hns_proof_details(path.to_str().unwrap(), "missing");
+
+        assert!(json.contains(r#""host":"missing""#));
+        assert!(json.contains(r#""name":"missing""#));
+        assert!(json.contains(r#""proofStatus":"unavailable""#));
+        assert!(json.contains(r#""cacheStatus":"resource_cache_missing""#));
+        assert!(json.contains(r#""resourceValueHex":null"#));
+        assert!(json.contains(r#""error":"resource cache is not initialized""#));
+
+        cleanup_dir(&path);
+    }
+
+    #[test]
     fn sync_status_json_escapes_errors() {
         let json = NativeSyncStatus::error("bad \"path\"\n".to_owned()).to_json();
 
@@ -2155,16 +3325,18 @@ mod tests {
     }
 
     #[test]
-    fn origin_response_reports_hns_tls_policy_after_origin_headers() {
+    fn origin_response_suppresses_spoofed_hns_tls_policy_origin_headers() {
         let response = origin_response(OriginResponse {
             status: 200,
             headers: vec![("X-HNS-TLS-Policy".to_owned(), "origin".to_owned())],
             body: b"ok".to_vec(),
             dane_decision: DaneDecision::WebPkiFallback,
+            tls_inspection: None,
         });
         let text = String::from_utf8(response).unwrap();
 
-        assert!(text.contains("X-HNS-TLS-Policy: origin\r\nX-HNS-TLS-Policy: webpki-fallback\r\n"));
+        assert!(!text.contains("X-HNS-TLS-Policy: origin\r\n"));
+        assert!(text.contains("X-HNS-TLS-Policy: webpki-fallback\r\n"));
     }
 
     #[test]
@@ -2175,6 +3347,7 @@ mod tests {
                 headers: Vec::new(),
                 body: b"ok".to_vec(),
                 dane_decision: DaneDecision::Matched(hns_dane::TlsaUsage::DaneEe),
+                tls_inspection: None,
             },
             Some("hns-doh-compat"),
         );
@@ -2183,6 +3356,138 @@ mod tests {
         assert!(
             text.contains("X-HNS-TLS-Policy: dane\r\nX-HNS-Resolver-Policy: hns-doh-compat\r\n",)
         );
+    }
+
+    #[test]
+    fn gateway_headers_strip_internal_strict_mode_control_header() {
+        let parsed =
+            parse_gateway_headers("Accept: text/html\r\nX-HNS-Browser-Strict-Mode: 1\r\n").unwrap();
+
+        assert!(parsed.strict_hns_mode);
+        assert_eq!(
+            parsed.headers,
+            vec![("Accept".to_owned(), "text/html".to_owned())]
+        );
+    }
+
+    #[test]
+    fn origin_response_includes_resolution_trace_headers() {
+        let response = origin_response_with_resolver_policy_and_trace(
+            OriginResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: b"ok".to_vec(),
+                dane_decision: DaneDecision::NoTlsa,
+                tls_inspection: None,
+            },
+            None,
+            r#"{"mode":"strict","fallback":{"used":false}}"#,
+        );
+        let text = String::from_utf8(response).unwrap();
+
+        assert!(text.contains("X-HNS-Resolver-Mode: strict\r\n"));
+        assert!(text.contains("X-HNS-DoH-Fallback: no\r\n"));
+        assert!(text.contains(
+            "X-HNS-Resolution-Trace: {\"mode\":\"strict\",\"fallback\":{\"used\":false}}\r\n",
+        ));
+    }
+
+    #[test]
+    fn resolution_trace_reports_authoritative_dns_attempts() {
+        let dns_trace = DnsTraceRecorder::default();
+        dns_trace.push(DnsTraceEvent {
+            protocol: "udp53",
+            server: "192.0.2.53:53".to_owned(),
+            status: "timeout".to_owned(),
+            error: Some("operation timed out".to_owned()),
+        });
+        dns_trace.push(DnsTraceEvent {
+            protocol: "tcp53",
+            server: "192.0.2.53:53".to_owned(),
+            status: "transport_error".to_owned(),
+            error: Some("connection refused".to_owned()),
+        });
+        let trace = resolution_trace_json(
+            &GatewayHttpRequestInput {
+                data_dir: "/tmp",
+                method: "GET",
+                scheme: "https",
+                host: "nathan.woodburn",
+                port: 443,
+                path_and_query: "/",
+                header_text: "",
+                body: &[],
+            },
+            GatewayResolutionMode::Strict,
+            None,
+            TlsTraceInput::default(),
+            Some(&GatewayError::Resolver(ResolverError::DnsTransport(
+                "operation timed out".to_owned(),
+            ))),
+            &FallbackMarker::default(),
+            &dns_trace,
+        );
+
+        assert!(
+            trace.contains(r#""authoritativeDns":{"udp53":"timeout","tcp53":"transport_error"}"#)
+        );
+        assert!(trace.contains(r#""nameserverCandidates":["192.0.2.53:53"]"#));
+        assert!(
+            trace.contains(r#""protocol":"udp53","server":"192.0.2.53:53","status":"timeout""#)
+        );
+    }
+
+    #[test]
+    fn resolution_trace_reports_tlsa_and_dane_details() {
+        let tlsa = TlsaRecord {
+            usage: TlsaUsage::DaneEe,
+            selector: TlsaSelector::SubjectPublicKeyInfo,
+            matching: TlsaMatching::Sha256,
+            association_data: vec![0xaa, 0xbb],
+        };
+        let tls = TlsValidation::hns_compatibility(true, vec![tlsa]);
+        let inspection = TlsCertificateInspection {
+            end_entity_der: b"cert".to_vec(),
+            end_entity_spki_der: b"spki".to_vec(),
+            intermediate_der: vec![b"issuer".to_vec()],
+            webpki_status: hns_dane::WebPkiStatus::Invalid,
+        };
+        let trace = resolution_trace_json(
+            &GatewayHttpRequestInput {
+                data_dir: "/tmp",
+                method: "GET",
+                scheme: "https",
+                host: "nathan.woodburn",
+                port: 443,
+                path_and_query: "/",
+                header_text: "",
+                body: &[],
+            },
+            GatewayResolutionMode::Compatibility,
+            None,
+            TlsTraceInput {
+                validation: Some(&tls),
+                decision: Some(&DaneDecision::Matched(TlsaUsage::DaneEe)),
+                inspection: Some(&inspection),
+            },
+            None,
+            &FallbackMarker::default(),
+            &DnsTraceRecorder::default(),
+        );
+
+        assert!(trace.contains(r#""tlsaOwner":"_443._tcp.nathan.woodburn""#));
+        assert!(trace.contains(r#""tlsaFound":true"#));
+        assert!(trace.contains(r#""dnssecSecure":true"#));
+        assert!(trace.contains(
+            r#""usage":"DANE-EE","selector":"SPKI","matching":"SHA-256","associationDataHex":"aabb""#
+        ));
+        assert!(trace.contains(r#""webPkiStatus":"invalid""#));
+        assert!(trace.contains(&format!(r#""spkiSha256":"{}""#, sha256_hex(b"spki"))));
+        assert!(trace.contains(r#""spkiDerHex":"73706b69""#));
+        assert!(trace.contains(r#""intermediateCount":1"#));
+        assert!(trace.contains(
+            r#""dane":{"decision":"verified","matchedUsage":"DANE-EE","certificateMatch":"pass","webPkiFallback":false}"#
+        ));
     }
 
     #[test]

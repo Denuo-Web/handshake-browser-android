@@ -132,6 +132,32 @@ class HnsWebViewGatewayInterceptorTest {
     }
 
     @Test
+    fun strictHnsModeAddsInternalGatewayHeaderAndStripsSpoofedValue() {
+        val bridge = RecordingGatewayBridge(
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+                .toByteArray(StandardCharsets.ISO_8859_1),
+        )
+        val dataDir = createTempDirectory("hns-webview-strict-mode-test").toFile()
+        val interceptor = HnsWebViewGatewayInterceptor(
+            dataDir = dataDir,
+            hnsGatewayBridge = bridge,
+            strictHnsMode = { true },
+        )
+
+        interceptor.intercept(
+            method = "GET",
+            url = "https://welcome/",
+            requestHeaders = mapOf(HNS_GATEWAY_STRICT_MODE_HEADER to "0"),
+        )
+
+        assertEquals(
+            listOf(HNS_GATEWAY_STRICT_MODE_HEADER to "1"),
+            bridge.calls.single().headers,
+        )
+        dataDir.deleteRecursively()
+    }
+
+    @Test
     fun dottedHnsFetchUsesNativeGatewayWhenTldIsNotCommonIcann() {
         val bridge = RecordingGatewayBridge(
             "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
@@ -173,7 +199,7 @@ class HnsWebViewGatewayInterceptorTest {
                 .toByteArray(StandardCharsets.ISO_8859_1),
         )
         val dataDir = createTempDirectory("hns-main-frame-status-test").toFile()
-        val interceptor = HnsWebViewGatewayInterceptor(dataDir, bridge) { status, tlsPolicy, resolverPolicy ->
+        val interceptor = HnsWebViewGatewayInterceptor(dataDir, bridge) { status, tlsPolicy, resolverPolicy, _ ->
             statuses += status
             tlsPolicies += tlsPolicy
             resolverPolicies += resolverPolicy
@@ -202,7 +228,7 @@ class HnsWebViewGatewayInterceptorTest {
                 .toByteArray(StandardCharsets.ISO_8859_1),
         )
         val dataDir = createTempDirectory("hns-subresource-status-test").toFile()
-        val interceptor = HnsWebViewGatewayInterceptor(dataDir, bridge) { status, _, _ ->
+        val interceptor = HnsWebViewGatewayInterceptor(dataDir, bridge) { status, _, _, _ ->
             statuses += status
         }
 

@@ -96,6 +96,12 @@ object NativeBridge : HnsGatewayBridge, HnsSyncBridge, LocalTlsCertificateProvid
         unavailableSyncJson("rust-core-unavailable")
     }
 
+    fun hnsProofDetails(dataDir: String, host: String): String = if (isLoaded) {
+        nativeHnsProofDetails(dataDir, host)
+    } else {
+        """{"host":"${jsonEscape(host)}","name":null,"nameHash":null,"hnsProof":"error","proofStatus":"error","secure":null,"exists":null,"treeRoot":null,"blockHeight":null,"cacheStatus":"rust_core_unavailable","resourceValueHex":null,"recordTypes":[],"resourceRecords":[],"currentTip":null,"error":"rust-core-unavailable"}"""
+    }
+
     override fun localTlsCertificate(host: String): LocalTlsCertificate? = if (isLoaded) {
         nativeLocalTlsCertificate(host)?.let(::parseLocalTlsCertificateBundle)
     } else {
@@ -174,6 +180,8 @@ object NativeBridge : HnsGatewayBridge, HnsSyncBridge, LocalTlsCertificateProvid
 
     private external fun nativeClearResolverCache(dataDir: String): String
 
+    private external fun nativeHnsProofDetails(dataDir: String, host: String): String
+
     private external fun nativeLocalTlsCertificate(host: String): ByteArray?
 
     private external fun nativeGatewayHttpResponse(
@@ -241,6 +249,14 @@ object NativeBridge : HnsGatewayBridge, HnsSyncBridge, LocalTlsCertificateProvid
 
     private fun unavailableSyncJson(error: String = "rust-core-unavailable"): String =
         """{"status":"error","attempted":0,"successful":0,"accepted":0,"failed":0,"peerCount":0,"peerGroups":0,"bestHeight":null,"bestPeerHeight":null,"estimatedTipHeight":null,"resourceCacheEntries":0,"resourceCacheBytes":0,"resourceCacheEvicted":0,"error":"$error","failures":[]}"""
+
+    private fun jsonEscape(value: String): String =
+        value
+            .replace("\\", "\\\\")
+            .replace("\"", "\\\"")
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+            .replace("\t", "\\t")
 
     private const val LOCAL_TLS_FINGERPRINT_BYTES = 32
 }

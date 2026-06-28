@@ -24,6 +24,7 @@ class LoopbackProxyServer(
     private val dataDir: File = File("."),
     private val hnsGatewayBridge: HnsGatewayBridge = NativeBridge,
     private val hnsConnectTerminator: HnsConnectTerminator = LocalTlsHnsConnectTerminator(),
+    private val strictHnsMode: () -> Boolean = { false },
     private val executor: ExecutorService = Executors.newCachedThreadPool(),
 ) : Closeable {
     private val running = AtomicBoolean(false)
@@ -172,7 +173,7 @@ class LoopbackProxyServer(
         }
         request.validateHostHeaderMatches(target)
         val body = readHnsRequestBody(client.getInputStream(), request)
-        val gatewayHeaders = request.headersForGateway()
+        val gatewayHeaders = request.headersForGateway(strictHnsMode())
         val fileResponse = hnsGatewayBridge.httpResponseBodyFile(
             dataDir = dataDir.absolutePath,
             method = request.line.method,
@@ -457,14 +458,17 @@ internal data class ProxyRequest(
         }
     }
 
-    fun headersForGateway(): List<Pair<String, String>> {
-        if (!hasTransferEncoding()) {
-            return headers
-        }
-        return headers
+    fun headersForGateway(strictHnsMode: Boolean = false): List<Pair<String, String>> {
+        val sanitized = headers
             .filterNot { it.first.equals("Transfer-Encoding", ignoreCase = true) }
             .filterNot { it.first.equals("Trailer", ignoreCase = true) }
-            .filterNot { it.first.equals("Content-Length", ignoreCase = true) }
+            .filterNot { hasTransferEncoding() && it.first.equals("Content-Length", ignoreCase = true) }
+            .filterNot { it.first.equals(HNS_GATEWAY_STRICT_MODE_HEADER, ignoreCase = true) }
+        return if (strictHnsMode) {
+            sanitized + (HNS_GATEWAY_STRICT_MODE_HEADER to "1")
+        } else {
+            sanitized
+        }
     }
 
     fun toOriginBytes(target: HttpTarget): ByteArray {

@@ -39,12 +39,14 @@ pub struct GatewayRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GatewayResponse {
     pub resolution: ResolutionAnswer,
+    pub origin_request: OriginRequest,
     pub origin: OriginResponse,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GatewayResponseHead {
     pub resolution: ResolutionAnswer,
+    pub origin_request: OriginRequest,
     pub origin: OriginResponseHead,
 }
 
@@ -119,7 +121,11 @@ where
     pub fn handle(&self, request: &GatewayRequest) -> Result<GatewayResponse, GatewayError> {
         let (resolution, origin_request) = self.resolve_origin_request(request)?;
         let origin = self.transport.fetch(&origin_request)?;
-        Ok(GatewayResponse { resolution, origin })
+        Ok(GatewayResponse {
+            resolution,
+            origin_request,
+            origin,
+        })
     }
 
     pub fn handle_to_writer(
@@ -129,7 +135,11 @@ where
     ) -> Result<GatewayResponseHead, GatewayError> {
         let (resolution, origin_request) = self.resolve_origin_request(request)?;
         let origin = self.transport.fetch_to_writer(&origin_request, body)?;
-        Ok(GatewayResponseHead { resolution, origin })
+        Ok(GatewayResponseHead {
+            resolution,
+            origin_request,
+            origin,
+        })
     }
 
     pub fn config(&self) -> &GatewayConfig {
@@ -509,6 +519,7 @@ mod tests {
                 headers: Vec::new(),
                 body: b"ok".to_vec(),
                 dane_decision: DaneDecision::NoTlsa,
+                tls_inspection: None,
             })
         }
     }
@@ -526,6 +537,7 @@ mod tests {
                 headers: Vec::new(),
                 body: b"ok".to_vec(),
                 dane_decision: DaneDecision::NoTlsa,
+                tls_inspection: None,
             })
         }
     }

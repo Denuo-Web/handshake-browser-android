@@ -1,7 +1,7 @@
 use bytes::{Buf, Bytes};
 use hns_dane::{
     DaneCertificateChainValidationInput, DaneDecision, DaneError, DomainTrustMode, TlsaRecord,
-    WebPkiStatus, evaluate_policy_with_certificate_chain,
+    WebPkiStatus, evaluate_policy_with_certificate_chain, extract_spki_der,
 };
 use http::{HeaderName, HeaderValue, Request as Http2Request};
 use rustls::client::WebPkiServerVerifier;
@@ -51,6 +51,7 @@ pub struct OriginResponse {
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     pub dane_decision: DaneDecision,
+    pub tls_inspection: Option<TlsCertificateInspection>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,6 +60,15 @@ pub struct OriginResponseHead {
     pub headers: Vec<(String, String)>,
     pub body_len: usize,
     pub dane_decision: DaneDecision,
+    pub tls_inspection: Option<TlsCertificateInspection>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TlsCertificateInspection {
+    pub end_entity_der: Vec<u8>,
+    pub end_entity_spki_der: Vec<u8>,
+    pub intermediate_der: Vec<Vec<u8>>,
+    pub webpki_status: WebPkiStatus,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -180,6 +190,7 @@ impl OriginResponse {
             headers: self.headers,
             body_len: self.body.len(),
             dane_decision: self.dane_decision,
+            tls_inspection: self.tls_inspection,
         }
     }
 }
@@ -265,7 +276,13 @@ impl TcpHttpTransport {
             .map_err(io_error)?;
 
         let decision = Arc::new(Mutex::new(None));
-        let config = self.client_config(request.tls.clone(), Arc::clone(&decision), Vec::new())?;
+        let inspection = Arc::new(Mutex::new(None));
+        let config = self.client_config(
+            request.tls.clone(),
+            Arc::clone(&decision),
+            Arc::clone(&inspection),
+            Vec::new(),
+        )?;
         let server_name = ServerName::try_from(request.host.clone())
             .map_err(|_| TransportError::InvalidRequest)?;
         let connection = ClientConnection::new(Arc::new(config), server_name).map_err(tls_error)?;
@@ -282,6 +299,7 @@ impl TcpHttpTransport {
             .ok_or_else(|| {
                 TransportError::Tls("TLS certificate policy was not evaluated".to_owned())
             })?;
+        response.tls_inspection = tls_inspection(inspection)?;
         Ok(response)
     }
 
@@ -301,7 +319,13 @@ impl TcpHttpTransport {
             .map_err(io_error)?;
 
         let decision = Arc::new(Mutex::new(None));
-        let config = self.client_config(request.tls.clone(), Arc::clone(&decision), Vec::new())?;
+        let inspection = Arc::new(Mutex::new(None));
+        let config = self.client_config(
+            request.tls.clone(),
+            Arc::clone(&decision),
+            Arc::clone(&inspection),
+            Vec::new(),
+        )?;
         let server_name = ServerName::try_from(request.host.clone())
             .map_err(|_| TransportError::InvalidRequest)?;
         let connection = ClientConnection::new(Arc::new(config), server_name).map_err(tls_error)?;
@@ -319,6 +343,7 @@ impl TcpHttpTransport {
             .ok_or_else(|| {
                 TransportError::Tls("TLS certificate policy was not evaluated".to_owned())
             })?;
+        response.tls_inspection = tls_inspection(inspection)?;
         Ok(response)
     }
 
@@ -330,6 +355,7 @@ impl TcpHttpTransport {
             headers: head.headers,
             body,
             dane_decision: head.dane_decision,
+            tls_inspection: head.tls_inspection,
         })
     }
 
@@ -369,9 +395,11 @@ impl TcpHttpTransport {
         let stream = connect_async(connection_host, request.port, self.connect_timeout).await?;
 
         let decision = Arc::new(Mutex::new(None));
+        let inspection = Arc::new(Mutex::new(None));
         let config = self.client_config(
             request.tls.clone(),
             Arc::clone(&decision),
+            Arc::clone(&inspection),
             vec![b"h2".to_vec()],
         )?;
         let server_name = ServerName::try_from(request.host.clone())
@@ -426,6 +454,7 @@ impl TcpHttpTransport {
             headers,
             body_len,
             dane_decision: tls_decision(decision)?,
+            tls_inspection: tls_inspection(inspection)?,
         })
     }
 
@@ -437,6 +466,7 @@ impl TcpHttpTransport {
             headers: head.headers,
             body,
             dane_decision: head.dane_decision,
+            tls_inspection: head.tls_inspection,
         })
     }
 
@@ -471,9 +501,11 @@ impl TcpHttpTransport {
         let remote = resolve_socket_addr_async(connection_host, request.port).await?;
 
         let decision = Arc::new(Mutex::new(None));
+        let inspection = Arc::new(Mutex::new(None));
         let config = self.client_config(
             request.tls.clone(),
             Arc::clone(&decision),
+            Arc::clone(&inspection),
             vec![b"h3".to_vec()],
         )?;
         let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(config)
@@ -562,6 +594,7 @@ impl TcpHttpTransport {
             headers,
             body_len,
             dane_decision: tls_decision(decision)?,
+            tls_inspection: tls_inspection(inspection)?,
         })
     }
 
@@ -569,6 +602,7 @@ impl TcpHttpTransport {
         &self,
         tls: TlsValidation,
         decision: Arc<Mutex<Option<DaneDecision>>>,
+        inspection: Arc<Mutex<Option<TlsCertificateInspection>>>,
         alpn_protocols: Vec<Vec<u8>>,
     ) -> Result<ClientConfig, TransportError> {
         let provider = rustls::crypto::ring::default_provider();
@@ -582,6 +616,7 @@ impl TcpHttpTransport {
             webpki,
             tls,
             decision,
+            inspection,
         });
 
         let mut config = ClientConfig::builder_with_provider(Arc::new(provider))
@@ -640,6 +675,7 @@ struct DaneServerCertVerifier {
     webpki: Arc<WebPkiServerVerifier>,
     tls: TlsValidation,
     decision: Arc<Mutex<Option<DaneDecision>>>,
+    inspection: Arc<Mutex<Option<TlsCertificateInspection>>>,
 }
 
 impl ServerCertVerifier for DaneServerCertVerifier {
@@ -685,6 +721,14 @@ impl ServerCertVerifier for DaneServerCertVerifier {
                     RustlsError::General("TLS decision lock is poisoned".to_owned())
                 })?;
                 *stored_decision = Some(decision);
+                let mut stored_inspection = self.inspection.lock().map_err(|_| {
+                    RustlsError::General("TLS inspection lock is poisoned".to_owned())
+                })?;
+                *stored_inspection = Some(tls_certificate_inspection(
+                    end_entity,
+                    intermediates,
+                    webpki_status,
+                )?);
                 Ok(ServerCertVerified::assertion())
             }
             Err(DaneError::WebPkiFailed) => webpki_result,
@@ -784,7 +828,7 @@ fn build_http2_request(request: &OriginRequest) -> Result<Http2Request<()>, Tran
         let headers = h2_request.headers_mut();
         headers.insert(
             HeaderName::from_static("user-agent"),
-            HeaderValue::from_static("hns-browser/0.1.5"),
+            HeaderValue::from_static("hns-browser/0.1.6"),
         );
         headers.insert(
             HeaderName::from_static("accept"),
@@ -912,7 +956,7 @@ fn build_http_request(request: &OriginRequest) -> Result<Vec<u8>, TransportError
     let mut out = Vec::new();
     write!(
         out,
-        "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: hns-browser/0.1.5\r\nAccept: */*\r\n",
+        "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: hns-browser/0.1.6\r\nAccept: */*\r\n",
         request.method.to_ascii_uppercase(),
         request.path_and_query,
         host_header(&request.host, request.port, &request.scheme),
@@ -975,6 +1019,7 @@ fn parse_http_response(
         headers: head.headers,
         body,
         dane_decision: head.dane_decision,
+        tls_inspection: head.tls_inspection,
     })
 }
 
@@ -1036,6 +1081,7 @@ fn parse_http_response_to_writer(
         headers,
         body_len,
         dane_decision: DaneDecision::NoTlsa,
+        tls_inspection: None,
     })
 }
 
@@ -1320,6 +1366,36 @@ fn tls_decision(
         .ok_or_else(|| TransportError::Tls("TLS certificate policy was not evaluated".to_owned()))
 }
 
+fn tls_inspection(
+    inspection: Arc<Mutex<Option<TlsCertificateInspection>>>,
+) -> Result<Option<TlsCertificateInspection>, TransportError> {
+    inspection
+        .lock()
+        .map_err(|_| TransportError::Tls("TLS inspection lock is poisoned".to_owned()))
+        .map(|inspection| inspection.clone())
+}
+
+fn tls_certificate_inspection(
+    end_entity: &CertificateDer<'_>,
+    intermediates: &[CertificateDer<'_>],
+    webpki_status: WebPkiStatus,
+) -> Result<TlsCertificateInspection, RustlsError> {
+    let end_entity_der = end_entity.as_ref().to_vec();
+    let end_entity_spki_der = extract_spki_der(&end_entity_der).map_err(|error| {
+        RustlsError::General(format!("TLS certificate inspection failed: {error}"))
+    })?;
+    let intermediate_der = intermediates
+        .iter()
+        .map(|certificate| certificate.as_ref().to_vec())
+        .collect();
+    Ok(TlsCertificateInspection {
+        end_entity_der,
+        end_entity_spki_der,
+        intermediate_der,
+        webpki_status,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1565,6 +1641,14 @@ mod tests {
             response.dane_decision,
             DaneDecision::Matched(TlsaUsage::DaneEe)
         );
+        let inspection = response.tls_inspection.expect("TLS inspection");
+        assert_eq!(inspection.end_entity_der, server.cert_der);
+        assert_eq!(
+            inspection.end_entity_spki_der,
+            extract_spki_der(&inspection.end_entity_der).unwrap(),
+        );
+        assert_eq!(inspection.intermediate_der.len(), 0);
+        assert_eq!(inspection.webpki_status, WebPkiStatus::Invalid);
     }
 
     #[test]
@@ -1643,6 +1727,13 @@ mod tests {
         assert_eq!(
             response.dane_decision,
             DaneDecision::Matched(TlsaUsage::DaneTa)
+        );
+        let inspection = response.tls_inspection.expect("TLS inspection");
+        assert_eq!(inspection.end_entity_der, server.cert_der);
+        assert_eq!(inspection.intermediate_der.len(), 1);
+        assert_eq!(
+            inspection.intermediate_der[0],
+            *server.intermediate_cert_der.as_ref().unwrap(),
         );
     }
 

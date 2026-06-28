@@ -17,7 +17,8 @@ class HnsWebViewGatewayInterceptor(
     private val dataDir: File,
     private val hnsGatewayBridge: HnsGatewayBridge = NativeBridge,
     private val allowProxyFallbackForBodyRequests: () -> Boolean = { false },
-    private val onMainFrameHnsStatus: (Int, HnsPageTlsPolicy?, HnsPageResolverPolicy?) -> Unit = { _, _, _ -> },
+    private val strictHnsMode: () -> Boolean = { false },
+    private val onMainFrameHnsStatus: (Int, HnsPageTlsPolicy?, HnsPageResolverPolicy?, String?) -> Unit = { _, _, _, _ -> },
 ) {
     fun intercept(request: WebResourceRequest): WebResourceResponse? {
         return intercept(
@@ -44,7 +45,12 @@ class HnsWebViewGatewayInterceptor(
     ): HnsInterceptedResponse? {
         val response = interceptInternal(method, url, requestHeaders, MAX_HNS_REDIRECTS)
         if (response != null && isForMainFrame) {
-            onMainFrameHnsStatus(response.statusCode, response.hnsTlsPolicy(), response.hnsResolverPolicy())
+            onMainFrameHnsStatus(
+                response.statusCode,
+                response.hnsTlsPolicy(),
+                response.hnsResolverPolicy(),
+                response.hnsResolutionTrace(),
+            )
         }
         return response
     }
@@ -119,9 +125,15 @@ class HnsWebViewGatewayInterceptor(
     }
 
     private fun gatewayHeaders(requestHeaders: Map<String, String>): List<Pair<String, String>> {
-        return requestHeaders
+        val headers = requestHeaders
             .filterKeys { name -> !isHopByHopOrSyntheticHeader(name) }
             .map { (name, value) -> name to value }
+            .filterNot { it.first.equals(HNS_GATEWAY_STRICT_MODE_HEADER, ignoreCase = true) }
+        return if (strictHnsMode()) {
+            headers + (HNS_GATEWAY_STRICT_MODE_HEADER to "1")
+        } else {
+            headers
+        }
     }
 
     private fun HnsInterceptedResponse.followHnsRedirects(
@@ -228,6 +240,9 @@ internal data class HnsInterceptedResponse(
             "hns-doh-compat" -> HnsPageResolverPolicy.HnsDohCompatibility
             else -> null
         }
+
+    fun hnsResolutionTrace(): String? =
+        headerValue(HNS_RESOLUTION_TRACE_HEADER)
 
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -428,7 +443,8 @@ private fun isHopByHopOrSyntheticHeader(name: String): Boolean {
         name.equals("Proxy-Connection", ignoreCase = true) ||
         name.equals("Transfer-Encoding", ignoreCase = true) ||
         name.equals("Content-Length", ignoreCase = true) ||
-        name.equals("Host", ignoreCase = true)
+        name.equals("Host", ignoreCase = true) ||
+        name.equals(HNS_GATEWAY_STRICT_MODE_HEADER, ignoreCase = true)
 }
 
 private val HEADER_END = byteArrayOf(
