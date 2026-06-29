@@ -28,6 +28,7 @@ pub const DEFAULT_PEER_DISCOVERY_TARGET: usize = 64;
 pub const DEFAULT_PEER_DISCOVERY_QUERY_PEERS: usize = 8;
 pub const DEFAULT_PARALLEL_PEER_PROBES: usize = 0;
 pub const DEFAULT_PARALLEL_HEADER_FETCH_PEERS: usize = 1;
+pub const DEFAULT_PEER_HEIGHT_REFRESH_INTERVAL_SECONDS: u64 = 0;
 const MAX_HSD_NAME_STATE_NAME_BYTES: usize = 63;
 const MAX_HSD_NAME_STATE_DATA_BYTES: usize = 512;
 const HSD_NAME_STATE_FIXED_TAIL_BYTES: usize = 10;
@@ -53,6 +54,7 @@ pub struct HeaderSyncRunnerConfig {
     pub parallel_peer_probes: usize,
     pub parallel_header_fetch_peers: usize,
     pub parallel_peer_probe_timeout: Duration,
+    pub peer_height_refresh_interval: u64,
     pub timeout: Duration,
     pub stop: Hash,
     pub malformed_ban_seconds: u64,
@@ -186,6 +188,7 @@ impl Default for HeaderSyncRunnerConfig {
             parallel_peer_probes: DEFAULT_PARALLEL_PEER_PROBES,
             parallel_header_fetch_peers: DEFAULT_PARALLEL_HEADER_FETCH_PEERS,
             parallel_peer_probe_timeout: DEFAULT_PARALLEL_PEER_PROBE_TIMEOUT,
+            peer_height_refresh_interval: DEFAULT_PEER_HEIGHT_REFRESH_INTERVAL_SECONDS,
             timeout: DEFAULT_SYNC_TIMEOUT,
             stop: Hash::ZERO,
             malformed_ban_seconds: DEFAULT_MALFORMED_BAN_SECONDS,
@@ -640,15 +643,22 @@ impl HeaderSyncRunner<TcpHeaderPeerConnector> {
         store: &SqlitePeerStore,
         now: u64,
     ) -> Result<usize, SyncError> {
+        let refresh_due =
+            peer_height_refresh_due(peers, now, self.config.peer_height_refresh_interval);
         if !self.config.discover_peers
             || self.config.parallel_peer_probes == 0
             || (peers.len() >= self.config.peer_discovery_target
-                && peers.iter().any(|peer| peer.last_height.0 > 0))
+                && peers.iter().any(|peer| peer.last_height.0 > 0)
+                && !refresh_due)
         {
             return Ok(0);
         }
 
-        let candidates = peers.select_outbound(self.config.parallel_peer_probes, now);
+        let candidates = if refresh_due {
+            peers.select_discovery_outbound(self.config.parallel_peer_probes, now, &HashSet::new())
+        } else {
+            peers.select_outbound(self.config.parallel_peer_probes, now)
+        };
         if candidates.len() <= 1 {
             return Ok(0);
         }
@@ -695,6 +705,19 @@ impl HeaderSyncRunner<TcpHeaderPeerConnector> {
             Ok(successful)
         })
     }
+}
+
+fn peer_height_refresh_due(peers: &PeerManager, now: u64, refresh_interval: u64) -> bool {
+    if refresh_interval == 0 {
+        return false;
+    }
+    let cutoff = now.saturating_sub(refresh_interval);
+    !peers.iter().any(|peer| {
+        peer.last_height.0 > 0
+            && peer
+                .last_connected_at
+                .is_some_and(|seen_at| seen_at >= cutoff)
+    })
 }
 
 enum ParallelPeerProbe {
@@ -1713,6 +1736,79 @@ mod tests {
 
         first_server.join().unwrap();
         second_server.join().unwrap();
+        cleanup_db_path(&path);
+    }
+
+    #[test]
+    fn header_sync_runner_parallel_probe_refreshes_stale_full_peer_table() {
+        let path = temp_db_path("parallel-probe-refresh");
+        let (first, first_server) = spawn_probe_server(Height(42), Vec::new());
+        let (second, second_server) = spawn_probe_server(Height(43), Vec::new());
+        let mut peers = PeerManager::default();
+        peers.record_success(first, Height(1), 100);
+        peers.record_success(second, Height(1), 100);
+        let runner = HeaderSyncRunner::with_config(
+            network::mainnet(),
+            TcpHeaderPeerConnector,
+            HeaderSyncRunnerConfig {
+                parallel_peer_probes: 2,
+                peer_discovery_target: 2,
+                peer_height_refresh_interval: 60,
+                ..HeaderSyncRunnerConfig::default()
+            },
+        );
+
+        {
+            let store = SqlitePeerStore::open(&path).unwrap();
+            let successful = runner
+                .probe_peers_parallel_and_persist(&mut peers, &store, 1_000)
+                .unwrap();
+
+            assert_eq!(successful, 2);
+            assert_eq!(peers.get(first).unwrap().last_height, Height(42));
+            assert_eq!(peers.get(second).unwrap().last_height, Height(43));
+            assert_eq!(
+                store.load_peer(second).unwrap().unwrap().last_height,
+                Height(43)
+            );
+            store.flush().unwrap();
+        }
+
+        first_server.join().unwrap();
+        second_server.join().unwrap();
+        cleanup_db_path(&path);
+    }
+
+    #[test]
+    fn header_sync_runner_parallel_probe_skips_fresh_full_peer_table() {
+        let path = temp_db_path("parallel-probe-fresh-skip");
+        let first: std::net::SocketAddr = "127.0.0.2:12038".parse().unwrap();
+        let second: std::net::SocketAddr = "127.0.0.3:12038".parse().unwrap();
+        let mut peers = PeerManager::default();
+        peers.record_success(first, Height(42), 950);
+        peers.record_success(second, Height(43), 950);
+        let runner = HeaderSyncRunner::with_config(
+            network::mainnet(),
+            TcpHeaderPeerConnector,
+            HeaderSyncRunnerConfig {
+                parallel_peer_probes: 2,
+                peer_discovery_target: 2,
+                peer_height_refresh_interval: 60,
+                ..HeaderSyncRunnerConfig::default()
+            },
+        );
+
+        {
+            let store = SqlitePeerStore::open(&path).unwrap();
+            let successful = runner
+                .probe_peers_parallel_and_persist(&mut peers, &store, 1_000)
+                .unwrap();
+
+            assert_eq!(successful, 0);
+            assert_eq!(peers.get(second).unwrap().last_height, Height(43));
+            store.flush().unwrap();
+        }
+
         cleanup_db_path(&path);
     }
 

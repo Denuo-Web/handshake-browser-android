@@ -46,7 +46,7 @@ const DNS_RCODE_NOERROR: u8 = 0;
 const DNS_RCODE_NXDOMAIN: u8 = 3;
 const DNSSEC_DO_FLAG: u32 = 0x8000;
 const DEFAULT_DNS_UDP_PAYLOAD: usize = 1232;
-const DEFAULT_GATEWAY_PROOF_PEERS: usize = 2;
+const DEFAULT_GATEWAY_PROOF_PEERS: usize = 8;
 const DEFAULT_GATEWAY_PROOF_TIMEOUT: Duration = Duration::from_secs(3);
 const ANDROID_COMPAT_AUTHORITATIVE_DNS_TIMEOUT: Duration = Duration::from_millis(900);
 const RESOURCE_PROOF_CACHE_CANONICAL_WINDOW: u32 = 144;
@@ -55,6 +55,7 @@ const ANDROID_HEADER_SYNC_BATCHES_PER_PEER: usize = 16;
 const ANDROID_PARALLEL_PEER_PROBES: usize = 32;
 const ANDROID_PARALLEL_HEADER_FETCH_PEERS: usize = 4;
 const ANDROID_MIN_PEER_TARGET: usize = 64;
+const ANDROID_PEER_HEIGHT_REFRESH_INTERVAL_SECONDS: u64 = 10 * 60;
 const MAINNET_GENESIS_TIME: u64 = 1_580_745_078;
 const MAINNET_TARGET_SPACING_SECONDS: u64 = 10 * 60;
 const HNS_DOH_HOST: &str = "hnsdoh.com";
@@ -194,7 +195,7 @@ impl GatewayProofProvider {
         }
 
         let now = now_unix_seconds();
-        let selected = peers.select_outbound(self.preferred_peers, now);
+        let selected = select_live_proof_peers(&peers, self.preferred_peers, now, best.height);
         if selected.is_empty() {
             peer_store
                 .save_manager(&peers)
@@ -670,12 +671,12 @@ fn doh_answer_from_body(
 }
 
 pub fn core_version() -> &'static str {
-    "hns-browser-rust-core/0.2.0"
+    "hns-browser-rust-core/0.2.1"
 }
 
 pub fn diagnostics_json() -> String {
     r#"{"core":"hns-browser-rust-core","version":"0.1.5","features":["header-hash","header-pow-validation","header-mainnet-difficulty-retarget","header-canonical-height-index","hns-name-hash","hns-dotted-root-label","urkel-proof-verification","urkel-proof-value-handoff","hns-name-state-resource-extraction","hns-resource-decoder","hns-resource-provider-adapter","hns-memory-resource-provider","hns-sqlite-resource-provider","hns-negative-cache","hns-ttl-cache-lru","hns-resource-cache-stats","hns-resource-cache-eviction","hns-resource-cache-cap-enforcement","hns-resource-cache-chain-anchors","hns-resource-cache-reorg-invalidation","hns-resource-cache-current-tip","hns-proof-backed-resolver-boundary","hns-delegating-resolver-boundary","hns-proof-backed-ns-address-hydration","hns-authoritative-dnssec-delegated-resolver","android-hns-doh-compat-resolver","dns-wire","dns-svcb-https","dnssec-ds-dnskey-link","dnssec-ds-sha1","dnssec-ds-sha384","dnssec-rrsig-signed-data","dnssec-canonical-name-rdata","dnssec-ecdsa-p256-verify","dnssec-ecdsa-p384-verify","dnssec-rsa-sha1-verify","dnssec-rsa-sha256-sha512-verify","dnssec-ed25519-verify","dnssec-signed-rrset-validation","dnssec-delegated-chain-validation","dnssec-delegated-no-data-validation","dnssec-delegated-name-error-validation","dnssec-delegated-cname-chain","dnssec-child-referral-validation","dnssec-child-cname-chain","dnssec-child-no-data-validation","dnssec-child-name-error-validation","dnssec-nsec-denial-validation","dnssec-nsec3-denial-validation","dnssec-nxdomain-name-error-validation","dane-policy","dane-certificate-chain-policy","x509-spki-extraction","p2p-codec","p2p-tcp-peer-connection","p2p-static-peer-source","p2p-dns-seed-source","p2p-getaddr-peer-discovery","p2p-discovery-rotation","p2p-peer-diversity","p2p-sqlite-peer-store","sync-coordinator","sync-header-runner","sync-multi-batch-header-runner","sync-parallel-peer-probing","sync-ranged-peer-rotation","sync-proof-scheduler","android-native-sync-once","android-sync-status","android-sync-outcome-status","android-sync-progress-heights","android-sync-high-batch-catchup","android-clear-resolver-cache","android-persistent-gateway-resolver","android-gateway-live-proof-fetch","android-gateway-header-forwarding","android-gateway-range-forwarding","android-gateway-body-forwarding","android-gateway-file-body-stream","android-webview-hns-intercept","android-service-worker-hns-intercept","android-hns-redirect-follow","android-actionable-hns-errors","hns-name-not-found-error","gateway-policy","gateway-hns-address-required","gateway-tlsa-service-scope","gateway-delegated-origin-address-lookup","gateway-origin-address-query","gateway-https-service-query","gateway-svcb-alpn-policy","gateway-actionable-nameserver-errors","gateway-cname-address-routing","android-proxy-gateway-hook","android-random-loopback-proxy-port","android-local-hns-connect-certs","hns-websocket-upgrade-fail-closed","http-origin-transport","http2-origin-transport","http3-origin-transport","http-origin-response-framing","https-rustls-transport","dane-tls-policy"],"securityDefault":"fail-closed"}"#
-    .replace("\"version\":\"0.1.5\"", "\"version\":\"0.2.0\"")
+    .replace("\"version\":\"0.1.5\"", "\"version\":\"0.2.1\"")
 }
 
 pub fn sync_once(data_dir: &str) -> String {
@@ -1163,6 +1164,7 @@ fn resolution_trace_json(
     fallback_marker: &FallbackMarker,
     dns_trace: &DnsTraceRecorder,
 ) -> String {
+    let dns_events = dns_trace.snapshot();
     let resource_types = resolution
         .map(|answer| {
             answer
@@ -1176,14 +1178,18 @@ fn resolution_trace_json(
                 .join(",")
         })
         .unwrap_or_default();
+    let authoritative_dns_used = dns_events
+        .iter()
+        .any(|event| event.protocol == "udp53" || event.protocol == "tcp53");
     let delegation = resolution
         .map(|answer| {
-            answer.records.iter().any(|record| {
-                matches!(
-                    record.record_type,
-                    RecordType::Ns | RecordType::Ds | RecordType::Unknown(6)
-                )
-            })
+            authoritative_dns_used
+                || answer.records.iter().any(|record| {
+                    matches!(
+                        record.record_type,
+                        RecordType::Ns | RecordType::Ds | RecordType::Unknown(6)
+                    )
+                })
         })
         .unwrap_or(false);
     let origin_address = resolution
@@ -1215,7 +1221,6 @@ fn resolution_trace_json(
     let final_error = error
         .map(|error| format!(r#""{}""#, json_escape(&error.to_string())))
         .unwrap_or_else(|| "null".to_owned());
-    let dns_events = dns_trace.snapshot();
     let authoritative_dns = authoritative_dns_trace_json(&dns_events);
     let dns_attempts = dns_trace_attempts_json(&dns_events);
 
@@ -2290,6 +2295,7 @@ fn run_sync_once(
             peer_discovery_target: ANDROID_MIN_PEER_TARGET,
             parallel_peer_probes: ANDROID_PARALLEL_PEER_PROBES,
             parallel_header_fetch_peers: ANDROID_PARALLEL_HEADER_FETCH_PEERS,
+            peer_height_refresh_interval: ANDROID_PEER_HEIGHT_REFRESH_INTERVAL_SECONDS,
             timeout,
             ..HeaderSyncRunnerConfig::default()
         },
@@ -2411,6 +2417,29 @@ fn best_peer_height(peers: &hns_p2p::PeerManager) -> Option<u32> {
         .map(|peer| peer.last_height.0)
         .filter(|height| *height > 0)
         .max()
+}
+
+fn select_live_proof_peers(
+    peers: &hns_p2p::PeerManager,
+    preferred_count: usize,
+    now: u64,
+    proof_height: Height,
+) -> Vec<SocketAddr> {
+    let mut candidates = peers
+        .iter()
+        .filter(|peer| !peer.is_banned(now) && peer.last_height >= proof_height)
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        left.score
+            .cmp(&right.score)
+            .then_with(|| right.last_height.cmp(&left.last_height))
+            .then_with(|| left.address.cmp(&right.address))
+    });
+    candidates
+        .into_iter()
+        .take(preferred_count)
+        .map(|peer| peer.address)
+        .collect()
 }
 
 fn estimated_mainnet_tip_height(now: u64) -> Option<u32> {
@@ -3019,7 +3048,7 @@ mod tests {
 
     #[test]
     fn version_is_stable() {
-        assert_eq!(core_version(), "hns-browser-rust-core/0.2.0");
+        assert_eq!(core_version(), "hns-browser-rust-core/0.2.1");
     }
 
     #[test]
@@ -3240,6 +3269,21 @@ mod tests {
         );
         assert_eq!(classify_cached_sync_status(Some(0), Some(0)), "idle");
         assert_eq!(classify_cached_sync_status(Some(10), None), "syncing");
+    }
+
+    #[test]
+    fn live_proof_peer_selection_ignores_zero_height_failed_peers() {
+        let stale: SocketAddr = "127.0.0.2:12038".parse().unwrap();
+        let current: SocketAddr = "127.0.0.3:12038".parse().unwrap();
+        let mut peers = PeerManager::default();
+        for _ in 0..32 {
+            peers.record_transient_failure(stale);
+        }
+        peers.record_success(current, Height(336_034), 1_000);
+
+        let selected = select_live_proof_peers(&peers, 8, 1_100, Height(336_034));
+
+        assert_eq!(selected, vec![current]);
     }
 
     #[test]
@@ -3633,6 +3677,44 @@ mod tests {
             trace.contains(r#""protocol":"udp53","server":"192.0.2.53:53","status":"timeout""#)
         );
         assert!(trace.contains(r#""elapsedMs":901"#));
+    }
+
+    #[test]
+    fn resolution_trace_marks_authoritative_dns_as_delegated() {
+        let dns_trace = DnsTraceRecorder::default();
+        dns_trace.push(DnsTraceEvent {
+            protocol: "udp53",
+            server: "192.0.2.53:53".to_owned(),
+            status: "ok".to_owned(),
+            elapsed_ms: 19,
+            error: None,
+        });
+        let trace = resolution_trace_json(
+            &GatewayHttpRequestInput {
+                data_dir: "/tmp",
+                method: "GET",
+                scheme: "https",
+                host: "denuoweb",
+                port: 443,
+                path_and_query: "/",
+                header_text: "",
+                body: &[],
+            },
+            GatewayResolutionMode::Compatibility,
+            Some(&ResolutionAnswer {
+                name: DnsName::from_ascii("denuoweb").unwrap(),
+                records: vec![address_record("denuoweb", [35, 212, 156, 128])],
+                secure: true,
+            }),
+            TlsTraceInput::default(),
+            None,
+            &FallbackMarker::default(),
+            &dns_trace,
+        );
+
+        assert!(trace.contains(r#""delegation":true"#));
+        assert!(trace.contains(r#""resourceRecords":["A"]"#));
+        assert!(trace.contains(r#""fallback":{"used":false"#));
     }
 
     #[test]

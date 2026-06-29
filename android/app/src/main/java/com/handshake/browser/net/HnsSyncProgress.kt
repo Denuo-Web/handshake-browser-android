@@ -33,7 +33,7 @@ data class HnsSyncProgress(
         }
 
     val shouldContinueSoon: Boolean
-        get() = isBehindKnownPeer || hasUnknownTargetProgress || status == "syncing"
+        get() = isBehind || hasUnknownTargetProgress || status == "syncing"
 
     val shouldRetrySoon: Boolean
         get() = status in RETRY_STATUSES || needsPeerDiscovery
