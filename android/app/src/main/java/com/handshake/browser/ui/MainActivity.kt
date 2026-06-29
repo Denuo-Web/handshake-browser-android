@@ -96,7 +96,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var syncProgressStats: TextView
     private lateinit var pageProgressBar: ProgressBar
     private lateinit var proxyController: HnsProxyController
-    private lateinit var loopbackProxyServer: LoopbackProxyServer
+    private var loopbackProxyServer: LoopbackProxyServer? = null
     private lateinit var assetLoader: WebViewAssetLoader
     private lateinit var webViewGatewayInterceptor: HnsWebViewGatewayInterceptor
     private var proxyAvailable: Boolean = false
@@ -107,6 +107,11 @@ class MainActivity : ComponentActivity() {
     private var mainFrameHnsTraceJson: String? = null
     private var lastSyncSnapshot: HnsSyncSnapshot? = null
     private var syncReceiverRegistered: Boolean = false
+    private var activityStarted: Boolean = false
+    private var activityDestroyed: Boolean = false
+    private var proxyOverrideApplied: Boolean = false
+    private var proxyOverrideClearing: Boolean = false
+    private var proxyStartPending: Boolean = false
     @Volatile
     private var activeMainFrameUrl: String? = null
     private var pageIsLoading: Boolean = false
@@ -118,18 +123,6 @@ class MainActivity : ComponentActivity() {
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
         GatewayEventLog.configureAppStorage(filesDir)
         proxyController = HnsProxyController(this)
-        loopbackProxyServer = LoopbackProxyServer(
-            EPHEMERAL_GATEWAY_PORT,
-            filesDir,
-            strictHnsMode = { HnsResolutionPreferences.strictHnsMode(this) },
-            onHnsStatus = { host, statusCode, tlsPolicy, resolverPolicy, traceJson ->
-                runOnUiThread {
-                    if (isActiveMainFrameHost(host) && mainFrameHnsStatusCode == null) {
-                        applyMainFrameHnsStatus(statusCode, tlsPolicy, resolverPolicy, traceJson)
-                    }
-                }
-            },
-        )
         webViewGatewayInterceptor = HnsWebViewGatewayInterceptor(
             dataDir = filesDir,
             allowProxyFallbackForBodyRequests = { proxyAvailable },
@@ -237,17 +230,7 @@ class MainActivity : ComponentActivity() {
 
         setContentView(root)
 
-        val gatewayStarted = loopbackProxyServer.start()
-        val gatewayPort = loopbackProxyServer.boundPort()
-        if (gatewayStarted && gatewayPort != null) {
-            proxyController.applyLoopbackProxy(gatewayPort) { applied ->
-                proxyAvailable = applied
-                refreshSecurityState()
-            }
-        } else {
-            proxyAvailable = false
-            refreshSecurityState()
-        }
+        startLoopbackGateway()
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
@@ -276,7 +259,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        activityStarted = true
         BrowserCookiePreferences.applyTo(webView)
+        startLoopbackGateway()
         registerSyncSnapshotReceiver()
         HnsSyncForegroundService.start(this)
         lastSyncSnapshot = HnsSyncSnapshot(
@@ -289,16 +274,104 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
+        activityStarted = false
         stopSyncStatusPolling()
         unregisterSyncSnapshotReceiver()
+        stopLoopbackGateway()
         super.onStop()
     }
 
     override fun onDestroy() {
-        proxyController.clear {}
-        loopbackProxyServer.close()
+        activityDestroyed = true
+        stopLoopbackGateway()
         syncStatusExecutor.shutdownNow()
         super.onDestroy()
+    }
+
+    private fun createLoopbackGateway(): LoopbackProxyServer =
+        LoopbackProxyServer(
+            EPHEMERAL_GATEWAY_PORT,
+            filesDir,
+            strictHnsMode = { HnsResolutionPreferences.strictHnsMode(this) },
+            onHnsStatus = { host, statusCode, tlsPolicy, resolverPolicy, traceJson ->
+                runOnUiThread {
+                    if (isActiveMainFrameHost(host) && mainFrameHnsStatusCode == null) {
+                        applyMainFrameHnsStatus(statusCode, tlsPolicy, resolverPolicy, traceJson)
+                    }
+                }
+            },
+        )
+
+    private fun startLoopbackGateway() {
+        if (activityDestroyed) {
+            return
+        }
+        if (proxyOverrideClearing) {
+            proxyStartPending = true
+            return
+        }
+        if (loopbackProxyServer != null) {
+            return
+        }
+
+        val gateway = createLoopbackGateway()
+        loopbackProxyServer = gateway
+        val gatewayStarted = gateway.start()
+        val gatewayPort = gateway.boundPort()
+        if (gatewayStarted && gatewayPort != null) {
+            proxyController.applyLoopbackProxy(gatewayPort) { applied ->
+                if (loopbackProxyServer !== gateway) {
+                    return@applyLoopbackProxy
+                }
+                proxyAvailable = applied
+                proxyOverrideApplied = applied
+                if (!applied) {
+                    loopbackProxyServer = null
+                    gateway.close()
+                }
+                refreshSecurityState()
+            }
+        } else {
+            if (loopbackProxyServer === gateway) {
+                loopbackProxyServer = null
+            }
+            proxyAvailable = false
+            gateway.close()
+            refreshSecurityState()
+        }
+    }
+
+    private fun stopLoopbackGateway() {
+        val gateway = loopbackProxyServer
+        val shouldClearProxy = gateway != null || proxyOverrideApplied
+        if (gateway != null) {
+            loopbackProxyServer = null
+            proxyAvailable = false
+            gateway.close()
+            refreshSecurityState()
+        } else {
+            proxyAvailable = false
+        }
+
+        if (!shouldClearProxy) {
+            return
+        }
+        if (proxyOverrideClearing) {
+            return
+        }
+
+        proxyOverrideClearing = true
+        proxyController.clear {
+            proxyOverrideClearing = false
+            proxyOverrideApplied = false
+            val shouldRestart = proxyStartPending && activityStarted && !activityDestroyed
+            proxyStartPending = false
+            if (shouldRestart) {
+                startLoopbackGateway()
+            } else {
+                refreshSecurityState()
+            }
+        }
     }
 
     private fun registerSyncSnapshotReceiver() {
