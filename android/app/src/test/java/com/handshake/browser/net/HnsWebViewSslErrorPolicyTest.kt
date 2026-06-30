@@ -16,6 +16,11 @@ class HnsWebViewSslErrorPolicyTest {
     }
 
     @Test
+    fun emojiHnsTlsUrlsAreEligibleAfterPunycodeNormalization() {
+        assertTrue(HnsWebViewSslErrorPolicy.isEligiblePinnedLocalCertificateUrl("https://🤝/"))
+    }
+
+    @Test
     fun pinnedLocalCertificatesRejectNonHnsAndNonTlsUrls() {
         assertFalse(HnsWebViewSslErrorPolicy.isEligiblePinnedLocalCertificateUrl("https://example.com/"))
         assertFalse(HnsWebViewSslErrorPolicy.isEligiblePinnedLocalCertificateUrl("ws://welcome/socket"))

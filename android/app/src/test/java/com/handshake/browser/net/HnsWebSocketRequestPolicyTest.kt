@@ -22,6 +22,20 @@ class HnsWebSocketRequestPolicyTest {
     }
 
     @Test
+    fun emojiHnsWssTargetIsNormalizedToPunycode() {
+        val target = HnsWebSocketRequestPolicy.validate(
+            sourceOrigin = "https://🤝",
+            activeMainFrameUrl = "https://🤝/",
+            targetUrl = "wss://🤝/ws?echo=1",
+            isMainFrame = true,
+        )
+
+        assertEquals("xn--5p9h", target.host)
+        assertEquals("/ws?echo=1", target.pathAndQuery)
+        assertEquals("https://xn--5p9h", target.origin)
+    }
+
+    @Test
     fun scopedHnsSubdomainTargetIsAllowed() {
         val target = HnsWebSocketRequestPolicy.validate(
             sourceOrigin = "https://denuoweb",

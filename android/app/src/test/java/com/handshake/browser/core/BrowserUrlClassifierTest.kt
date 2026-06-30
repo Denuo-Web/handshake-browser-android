@@ -51,6 +51,24 @@ class BrowserUrlClassifierTest {
     }
 
     @Test
+    fun emojiHnsNameDefaultsToPunycodeHnsHttpsGateway() {
+        val target = classifier.classify("🤝")
+
+        assertEquals(BrowserTargetKind.HnsName, target.kind)
+        assertEquals("https://xn--5p9h/", target.url)
+        assertEquals("xn--5p9h", target.displayHost)
+    }
+
+    @Test
+    fun explicitEmojiHnsUrlUsesPunycodeHnsMode() {
+        val target = classifier.classify("https://🤝")
+
+        assertEquals(BrowserTargetKind.HnsName, target.kind)
+        assertEquals("https://xn--5p9h", target.url)
+        assertEquals("xn--5p9h", target.displayHost)
+    }
+
+    @Test
     fun dottedHostUsesNormalWebMode() {
         val target = classifier.classify("example.com")
 

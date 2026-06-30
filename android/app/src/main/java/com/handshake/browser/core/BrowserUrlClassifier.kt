@@ -1,6 +1,5 @@
 package com.handshake.browser.core
 
-import java.net.IDN
 import java.net.URI
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
@@ -45,7 +44,7 @@ class BrowserUrlClassifier(
             return search(trimmed)
         }
 
-        val asciiHost = runCatching { IDN.toASCII(hostCandidate).lowercase(Locale.US) }.getOrNull()
+        val asciiHost = HostnameAscii.toAscii(hostCandidate)
             ?: return search(trimmed)
 
         if (!isValidHost(asciiHost)) {
@@ -70,15 +69,16 @@ class BrowserUrlClassifier(
         if (scheme != "http" && scheme != "https") {
             return search(url)
         }
-        val host = uri.httpAuthorityHost()
-            ?.takeIf(::isValidHttpHost)
+        val authority = uri.httpAuthority()
+            ?: return search(url)
+        val host = authority.host.takeIf(::isValidHttpHost)
             ?: return search(url)
         val kind = if (HnsHostPolicy.requiresHnsResolution(host)) {
             BrowserTargetKind.HnsName
         } else {
             BrowserTargetKind.ExactUrl
         }
-        return BrowserTarget(kind, url, host)
+        return BrowserTarget(kind, uri.withAuthority(authority) ?: return search(url), host)
     }
 
     private fun search(query: String): BrowserTarget {
@@ -108,12 +108,11 @@ class BrowserUrlClassifier(
         return isValidHost(host)
     }
 
-    private fun URI.httpAuthorityHost(): String? {
+    private fun URI.httpAuthority(): ParsedHttpAuthority? {
         val authority = rawAuthority ?: return null
         if (authority.isBlank() || authority.contains('@')) {
             return null
         }
-        host?.let { return normalizeHost(it) }
 
         val hostPart = if (authority.startsWith("[")) {
             val endBracket = authority.indexOf(']')
@@ -142,21 +141,37 @@ class BrowserUrlClassifier(
             }
         }
 
-        return normalizeHost(hostPart)
+        val host = normalizeHost(hostPart) ?: return null
+        val portSuffix = if (authority.startsWith("[")) {
+            authority.substring(authority.indexOf(']') + 1)
+        } else if (authority.count { it == ':' } == 1) {
+            authority.substring(authority.indexOf(':'))
+        } else {
+            ""
+        }
+        return ParsedHttpAuthority(host, portSuffix)
     }
 
     private fun normalizeHost(host: String): String? {
-        if (host.isBlank() || host.any { it.isWhitespace() || it == '/' || it == '?' || it == '#' }) {
-            return null
-        }
-
-        return runCatching {
-            IDN.toASCII(host.removeSurrounding("[", "]")).lowercase(Locale.US)
-        }.getOrNull()
+        return HostnameAscii.toAscii(host)
     }
 
     private fun isValidPortSuffix(value: String): Boolean =
         value.length > 1 &&
             value[0] == ':' &&
             value.drop(1).toIntOrNull()?.let { it in 1..65535 } == true
+
+    private fun URI.withAuthority(authority: ParsedHttpAuthority): String? {
+        val scheme = scheme?.lowercase(Locale.US) ?: return null
+        val host = if (authority.host.contains(':')) "[${authority.host}]" else authority.host
+        val path = rawPath.orEmpty()
+        val query = rawQuery?.let { "?$it" }.orEmpty()
+        val fragment = rawFragment?.let { "#$it" }.orEmpty()
+        return "$scheme://$host${authority.portSuffix}$path$query$fragment"
+    }
+
+    private data class ParsedHttpAuthority(
+        val host: String,
+        val portSuffix: String,
+    )
 }

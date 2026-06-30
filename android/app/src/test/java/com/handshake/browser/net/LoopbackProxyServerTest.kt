@@ -74,6 +74,16 @@ class LoopbackProxyServerTest {
     }
 
     @Test
+    fun parsesEmojiHnsAbsoluteHttpTargetAsPunycode() {
+        val target = ProxyRequestLine.parse("GET https://🤝/path?q=1 HTTP/1.1").toHttpTarget()
+
+        assertEquals("https", target.scheme)
+        assertEquals("xn--5p9h", target.host)
+        assertEquals(443, target.port)
+        assertEquals("/path?q=1", target.pathAndQuery)
+    }
+
+    @Test
     fun parsesWebSocketAbsoluteHttpTarget() {
         val target = ProxyRequestLine.parse("GET wss://welcome/socket HTTP/1.1").toHttpTarget()
 

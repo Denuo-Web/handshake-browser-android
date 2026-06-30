@@ -1,11 +1,10 @@
 package com.handshake.browser.net
 
-import java.net.IDN
+import com.handshake.browser.core.HostnameAscii
 import java.net.URI
-import java.util.Locale
 
 internal fun URI.httpAuthorityHost(): String? {
-    host?.let { return it.lowercase(Locale.US) }
+    host?.let { return HostnameAscii.toAscii(it) }
 
     val authority = rawAuthority ?: return null
     if (authority.isBlank() || authority.contains('@')) {
@@ -43,7 +42,7 @@ internal fun URI.httpAuthorityHost(): String? {
         return null
     }
 
-    return runCatching { IDN.toASCII(hostPart).lowercase(Locale.US) }.getOrNull()
+    return HostnameAscii.toAscii(hostPart)
 }
 
 private fun isValidPortSuffix(value: String): Boolean {

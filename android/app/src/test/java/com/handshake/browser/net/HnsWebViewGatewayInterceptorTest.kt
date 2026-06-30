@@ -196,6 +196,26 @@ class HnsWebViewGatewayInterceptorTest {
     }
 
     @Test
+    fun emojiHnsFetchUsesPunycodeNativeGatewayHost() {
+        val bridge = RecordingGatewayBridge(
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+                .toByteArray(StandardCharsets.ISO_8859_1),
+        )
+        val dataDir = createTempDirectory("hns-emoji-webview-intercept-test").toFile()
+        val interceptor = HnsWebViewGatewayInterceptor(dataDir, bridge)
+
+        val response = interceptor.intercept(
+            method = "GET",
+            url = "https://🤝/path",
+            requestHeaders = emptyMap(),
+        )
+
+        requireNotNull(response)
+        assertEquals("xn--5p9h", bridge.calls.single().host)
+        dataDir.deleteRecursively()
+    }
+
+    @Test
     fun mainFrameHnsResponseReportsFinalStatus() {
         val statuses = mutableListOf<Int>()
         val tlsPolicies = mutableListOf<HnsPageTlsPolicy?>()
