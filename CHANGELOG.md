@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.2.7 - 2026-06-30
+
+### Changed
+
+- Updated the bundled HNS directory homepage organization and footer copy.
+
 ## 0.2.6 - 2026-06-30
 
 ### Fixed
