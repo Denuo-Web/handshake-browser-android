@@ -20,8 +20,10 @@ import android.os.Handler
 import android.os.Looper
 import android.text.TextUtils
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.View
 import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebChromeClient
 import android.webkit.SslErrorHandler
@@ -160,12 +162,16 @@ class MainActivity : ComponentActivity() {
             minHeight = dp(48)
             imeOptions = EditorInfo.IME_ACTION_GO
             setSelectAllOnFocus(true)
-            setOnEditorActionListener { _, actionId, _ ->
-                if (actionId == EditorInfo.IME_ACTION_GO) {
+            setOnEditorActionListener { _, actionId, event ->
+                val enterKeyUp = event?.keyCode == KeyEvent.KEYCODE_ENTER &&
+                    event.action == KeyEvent.ACTION_UP
+                val enterKeyDown = event?.keyCode == KeyEvent.KEYCODE_ENTER &&
+                    event.action == KeyEvent.ACTION_DOWN
+                if (actionId == EditorInfo.IME_ACTION_GO || enterKeyUp) {
                     loadFromInput()
                     true
                 } else {
-                    false
+                    enterKeyDown
                 }
             }
         }
@@ -665,7 +671,15 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun loadFromInput() {
-        loadTarget(classifier.classify(omnibox.text.toString()))
+        val input = omnibox.text.toString()
+        dismissOmniboxKeyboard()
+        loadTarget(classifier.classify(input))
+    }
+
+    private fun dismissOmniboxKeyboard() {
+        omnibox.clearFocus()
+        getSystemService(InputMethodManager::class.java)
+            .hideSoftInputFromWindow(omnibox.windowToken, 0)
     }
 
     private fun loadTarget(target: com.handshake.browser.core.BrowserTarget) {
