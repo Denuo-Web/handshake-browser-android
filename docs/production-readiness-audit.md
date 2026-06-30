@@ -40,5 +40,5 @@ This audit treats the app as a Play Store closed-testing candidate and checks th
 
 - First-launch notification permission is requested because sync runs as a visible data-sync foreground service. If tester feedback shows the prompt is confusing, add an in-app rationale screen before requesting the permission.
 - General-purpose browsing can reach arbitrary third-party web content; keep target audience and content rating conservative.
-- HNS WebSocket / HTTP Upgrade for HNS origins remains fail-closed until native stream tunneling is implemented.
+- HNS WebSocket / HTTP Upgrade for HNS origins now uses native stream tunneling after HNS resolution, HTTPS/SVCB policy, and DANE validation; keep regression coverage around bridge-unavailable and validation-failure fail-closed behavior.
 - Parallel/ranged header sync remains bounded by Handshake header-chain validation order and peer/protocol pacing; performance work should avoid weakening canonical-header validation.

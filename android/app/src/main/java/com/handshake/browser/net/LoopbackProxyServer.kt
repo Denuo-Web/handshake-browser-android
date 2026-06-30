@@ -169,7 +169,8 @@ class LoopbackProxyServer(
     private fun handleHnsGatewayHttp(client: Socket, request: ProxyRequest, target: HttpTarget) {
         try {
             if (request.isProtocolUpgrade() || target.scheme.equals("ws", ignoreCase = true) || target.scheme.equals("wss", ignoreCase = true)) {
-                throw ProxyHttpException(501, "HNS Protocol Upgrade Unsupported")
+                handleHnsGatewayUpgrade(client, request, target)
+                return
             }
             request.validateHostHeaderMatches(target)
             if (!rateLimiter.tryAdmitHnsRequest(target.host)) {
@@ -209,6 +210,32 @@ class LoopbackProxyServer(
             GatewayEventLog.record("proxy_reject", target.host, error.status, error.reason)
             onHnsStatus(target.host, error.status, null, null, null)
             throw error
+        }
+    }
+
+    private fun handleHnsGatewayUpgrade(client: Socket, request: ProxyRequest, target: HttpTarget) {
+        request.validateHostHeaderMatches(target)
+        request.rejectTransferEncoding()
+        if (request.validatedContentLength() != 0L) {
+            throw ProxyHttpException(400, "Bad Request Framing")
+        }
+        if (!rateLimiter.tryAdmitHnsRequest(target.host)) {
+            throw ProxyHttpException(429, "Too Many Requests")
+        }
+        client.soTimeout = 0
+        val tunneled = hnsGatewayBridge.httpUpgradeTunnel(
+            dataDir = dataDir.absolutePath,
+            method = request.line.method,
+            scheme = target.scheme,
+            host = target.host,
+            port = target.port,
+            pathAndQuery = target.pathAndQuery,
+            headers = request.headersForGateway(strictHnsMode()),
+            clientInput = client.getInputStream(),
+            clientOutput = client.getOutputStream(),
+        )
+        if (!tunneled) {
+            throw ProxyHttpException(501, "HNS Protocol Upgrade Unsupported")
         }
     }
 
@@ -736,10 +763,18 @@ internal data class ProxyRequestLine(
     }
 
     fun toConnectedHttpTarget(connectTarget: ConnectTarget): HttpTarget {
-        if (target.startsWith("http://", ignoreCase = true) || target.startsWith("https://", ignoreCase = true)) {
+        if (
+            target.startsWith("http://", ignoreCase = true) ||
+            target.startsWith("https://", ignoreCase = true) ||
+            target.startsWith("ws://", ignoreCase = true) ||
+            target.startsWith("wss://", ignoreCase = true)
+        ) {
             val absoluteTarget = toHttpTarget()
             if (
-                absoluteTarget.scheme != "https" ||
+                (
+                    absoluteTarget.scheme != "https" &&
+                        absoluteTarget.scheme != "wss"
+                    ) ||
                 !sameHost(absoluteTarget.host, connectTarget.host) ||
                 absoluteTarget.port != connectTarget.port
             ) {

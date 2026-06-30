@@ -9,6 +9,8 @@ import org.junit.Before
 import org.junit.Test
 import java.io.File
 import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
@@ -739,8 +741,8 @@ class LoopbackProxyServerTest {
     }
 
     @Test
-    fun hnsConnectWebSocketUpgradeFailsClosedBeforeNativeGateway() {
-        val bridge = RecordingGatewayBridge(
+    fun hnsConnectWebSocketUpgradeTunnelsThroughNativeGateway() {
+        val bridge = TunnelGatewayBridge(
             "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
                 .toByteArray(StandardCharsets.ISO_8859_1),
         )
@@ -758,24 +760,43 @@ class LoopbackProxyServerTest {
                 socket.getOutputStream().write(
                     (
                         "CONNECT welcome:443 HTTP/1.1\r\nHost: welcome:443\r\n\r\n" +
-                            "GET /socket HTTP/1.1\r\nHost: welcome\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: test\r\nSec-WebSocket-Version: 13\r\n\r\n"
+                            "GET wss://welcome/socket HTTP/1.1\r\nHost: welcome\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: test\r\nSec-WebSocket-Version: 13\r\n\r\nping"
                         ).toByteArray(StandardCharsets.ISO_8859_1),
                 )
                 socket.getOutputStream().flush()
 
                 val response = socket.getInputStream().readBytes().toString(StandardCharsets.ISO_8859_1)
                 assertTrue(response.startsWith("HTTP/1.1 200 Connection Established\r\n"))
-                assertTrue(response.contains("HTTP/1.1 501 HNS Protocol Upgrade Unsupported\r\n"))
+                assertTrue(response.contains("HTTP/1.1 101 Switching Protocols\r\n"))
+                assertTrue(response.endsWith("ping"))
             }
         }
 
-        assertTrue(bridge.calls.isEmpty())
+        assertEquals(
+            GatewayCall(
+                dataDir.absolutePath,
+                "GET",
+                "wss",
+                "welcome",
+                443,
+                "/socket",
+                listOf(
+                    "Host" to "welcome",
+                    "Upgrade" to "websocket",
+                    "Connection" to "Upgrade",
+                    "Sec-WebSocket-Key" to "test",
+                    "Sec-WebSocket-Version" to "13",
+                ),
+                "",
+            ),
+            bridge.calls.single(),
+        )
         dataDir.deleteRecursively()
     }
 
     @Test
-    fun hnsPlainWebSocketUpgradeFailsClosedBeforeNativeGateway() {
-        val bridge = RecordingGatewayBridge(
+    fun hnsPlainWebSocketUpgradeTunnelsThroughNativeGateway() {
+        val bridge = TunnelGatewayBridge(
             "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
                 .toByteArray(StandardCharsets.ISO_8859_1),
         )
@@ -786,7 +807,53 @@ class LoopbackProxyServerTest {
 
             Socket(InetAddress.getByName("127.0.0.1"), port).use { socket ->
                 socket.getOutputStream().write(
-                    "GET ws://welcome/socket HTTP/1.1\r\nHost: welcome\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: test\r\nSec-WebSocket-Version: 13\r\n\r\n"
+                    "GET ws://welcome/socket HTTP/1.1\r\nHost: welcome\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: test\r\nSec-WebSocket-Version: 13\r\n\r\nping"
+                        .toByteArray(StandardCharsets.ISO_8859_1),
+                )
+                socket.getOutputStream().flush()
+
+                val response = socket.getInputStream().readBytes().toString(StandardCharsets.ISO_8859_1)
+                assertTrue(response.startsWith("HTTP/1.1 101 Switching Protocols\r\n"))
+                assertTrue(response.endsWith("ping"))
+            }
+        }
+
+        assertEquals(
+            GatewayCall(
+                dataDir.absolutePath,
+                "GET",
+                "ws",
+                "welcome",
+                80,
+                "/socket",
+                listOf(
+                    "Host" to "welcome",
+                    "Upgrade" to "websocket",
+                    "Connection" to "Upgrade",
+                    "Sec-WebSocket-Key" to "test",
+                    "Sec-WebSocket-Version" to "13",
+                ),
+                "",
+            ),
+            bridge.calls.single(),
+        )
+        dataDir.deleteRecursively()
+    }
+
+    @Test
+    fun hnsWebSocketUpgradeFailsClosedWhenNativeTunnelUnavailable() {
+        val bridge = RecordingGatewayBridge(
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                .toByteArray(StandardCharsets.ISO_8859_1),
+        )
+        val dataDir = createTempDirectory("hns-proxy-websocket-unavailable-test").toFile()
+        LoopbackProxyServer(0, dataDir = dataDir, hnsGatewayBridge = bridge).use { proxy ->
+            assertTrue(proxy.start())
+            val port = requireNotNull(proxy.boundPort())
+
+            Socket(InetAddress.getByName("127.0.0.1"), port).use { socket ->
+                socket.getOutputStream().write(
+                    "GET ws://welcome/socket HTTP/1.1\r\nHost: welcome\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
                         .toByteArray(StandardCharsets.ISO_8859_1),
                 )
                 socket.getOutputStream().flush()
@@ -1080,6 +1147,62 @@ class LoopbackProxyServerTest {
                 body.toString(StandardCharsets.ISO_8859_1),
             )
             return HnsGatewayFileResponse(responseHead, bodyFile)
+        }
+    }
+
+    private class TunnelGatewayBridge(
+        private val responseHead: ByteArray,
+    ) : HnsGatewayBridge {
+        val calls = mutableListOf<GatewayCall>()
+
+        override fun httpResponse(
+            dataDir: String,
+            method: String,
+            scheme: String,
+            host: String,
+            port: Int,
+            pathAndQuery: String,
+            headers: List<Pair<String, String>>,
+            body: ByteArray,
+        ): ByteArray {
+            error("byte-array fallback should not be used for upgrades")
+        }
+
+        override fun httpUpgradeTunnel(
+            dataDir: String,
+            method: String,
+            scheme: String,
+            host: String,
+            port: Int,
+            pathAndQuery: String,
+            headers: List<Pair<String, String>>,
+            clientInput: InputStream,
+            clientOutput: OutputStream,
+        ): Boolean {
+            calls += GatewayCall(
+                dataDir,
+                method,
+                scheme,
+                host,
+                port,
+                pathAndQuery,
+                headers,
+                "",
+            )
+            clientOutput.write(responseHead)
+            clientOutput.flush()
+            val payload = ByteArray(4)
+            var offset = 0
+            while (offset < payload.size) {
+                val read = clientInput.read(payload, offset, payload.size - offset)
+                if (read < 0) {
+                    return true
+                }
+                offset += read
+            }
+            clientOutput.write(payload)
+            clientOutput.flush()
+            return true
         }
     }
 

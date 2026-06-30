@@ -389,6 +389,8 @@ Implement origin transports:
 - Retries
 - Session resumption
 
+Current implementation covers bounded HTTP/1.1 pooling, rustls session resumption scoped by TLS/DANE policy and ALPN, and same-port Alt-Svc promotion to implemented HTTP/2/HTTP/3 transports.
+
 ### Important architecture
 
 - WebView talks to local gateway.
@@ -422,6 +424,8 @@ Implement a local proxy/gateway:
 - Compression handling
 - Range requests
 - Large download streaming
+
+Current implementation routes HNS WebSocket/HTTP Upgrade through a native stream tunnel after HNS resolution, HTTPS/SVCB policy, and DANE validation. It still fails closed when tunnel validation fails or the native bridge is unavailable.
 
 ### For DANE HTTPS
 
@@ -465,6 +469,8 @@ Avoid unnecessary MITM if using an HTTP fetch bridge for WebView-controlled brow
 - WebSockets work.
 - Large files stream without buffering whole body.
 - HNS HTTPS page loads only after DANE validation.
+
+Current Android proxy coverage includes HNS WebSocket/HTTP Upgrade native tunneling and bridge-unavailable fail-closed fallback.
 
 ## Phase 11: Android Browser Shell
 

@@ -21,20 +21,23 @@ use hns_sync::{
     TcpHeaderPeerConnector,
 };
 use hns_transport::{
-    OriginProtocol, OriginRequest, OriginResponse, OriginResponseHead, OriginTransport,
+    OriginProtocol, OriginRequest, OriginResponse, OriginResponseHead, OriginTransport, ReadWrite,
     TcpHttpTransport, TlsCertificateInspection, TlsValidation, TransportError,
 };
 use hns_urkel::UrkelProofVerifier;
 use jni::JNIEnv;
-use jni::objects::{JByteArray, JClass, JString};
-use jni::sys::{jbyteArray, jint, jstring};
+use jni::JavaVM;
+use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString, JValue};
+use jni::sys::{jboolean, jbyteArray, jint, jstring};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
+use std::io::{ErrorKind, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_RESOURCE_CACHE_LIMIT_BYTES: usize = 50 * 1024 * 1024;
@@ -64,6 +67,7 @@ const HNS_GATEWAY_STRICT_MODE_HEADER: &str = "X-HNS-Browser-Strict-Mode";
 const HNS_RESOLUTION_TRACE_HEADER: &str = "X-HNS-Resolution-Trace";
 const HNS_RESOLVER_MODE_HEADER: &str = "X-HNS-Resolver-Mode";
 const HNS_DOH_FALLBACK_HEADER: &str = "X-HNS-DoH-Fallback";
+const TUNNEL_COPY_BUFFER_BYTES: usize = 16 * 1024;
 static DOH_QUERY_ID: AtomicU16 = AtomicU16::new(0x484e);
 
 pub struct GatewayHttpRequestInput<'a> {
@@ -114,6 +118,103 @@ struct JniGatewayHttpRequest<'local> {
     path_and_query: JString<'local>,
     header_text: JString<'local>,
     body: JByteArray<'local>,
+}
+
+struct JavaInputStream {
+    vm: Arc<JavaVM>,
+    stream: GlobalRef,
+}
+
+struct JavaOutputStream {
+    vm: Arc<JavaVM>,
+    stream: GlobalRef,
+}
+
+impl JavaInputStream {
+    fn new(vm: Arc<JavaVM>, stream: GlobalRef) -> Self {
+        Self { vm, stream }
+    }
+}
+
+impl JavaOutputStream {
+    fn new(vm: Arc<JavaVM>, stream: GlobalRef) -> Self {
+        Self { vm, stream }
+    }
+}
+
+impl Read for JavaInputStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let length = buf.len().min(TUNNEL_COPY_BUFFER_BYTES);
+        let mut env = self
+            .vm
+            .attach_current_thread()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let array = env
+            .new_byte_array(length as i32)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let array_object = JObject::from(array);
+        let read = env
+            .call_method(
+                self.stream.as_obj(),
+                "read",
+                "([B)I",
+                &[JValue::Object(&array_object)],
+            )
+            .and_then(|value| value.i())
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        if read < 0 {
+            return Ok(0);
+        }
+        let array = JByteArray::from(array_object);
+        let bytes = env
+            .convert_byte_array(&array)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let read = read as usize;
+        buf[..read].copy_from_slice(&bytes[..read]);
+        Ok(read)
+    }
+}
+
+impl Write for JavaOutputStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let length = buf.len().min(TUNNEL_COPY_BUFFER_BYTES);
+        let mut env = self
+            .vm
+            .attach_current_thread()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let array = env
+            .byte_array_from_slice(&buf[..length])
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let array_object = JObject::from(array);
+        env.call_method(
+            self.stream.as_obj(),
+            "write",
+            "([BII)V",
+            &[
+                JValue::Object(&array_object),
+                JValue::Int(0),
+                JValue::Int(length as i32),
+            ],
+        )
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+        Ok(length)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut env = self
+            .vm
+            .attach_current_thread()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        env.call_method(self.stream.as_obj(), "flush", "()V", &[])
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        Ok(())
+    }
 }
 
 struct GatewayProofProvider {
@@ -675,7 +776,7 @@ pub fn core_version() -> &'static str {
 }
 
 pub fn diagnostics_json() -> String {
-    r#"{"core":"hns-browser-rust-core","version":"0.1.5","features":["header-hash","header-pow-validation","header-mainnet-difficulty-retarget","header-canonical-height-index","hns-name-hash","hns-dotted-root-label","urkel-proof-verification","urkel-proof-value-handoff","hns-name-state-resource-extraction","hns-resource-decoder","hns-resource-provider-adapter","hns-memory-resource-provider","hns-sqlite-resource-provider","hns-negative-cache","hns-ttl-cache-lru","hns-resource-cache-stats","hns-resource-cache-eviction","hns-resource-cache-cap-enforcement","hns-resource-cache-chain-anchors","hns-resource-cache-reorg-invalidation","hns-resource-cache-current-tip","hns-proof-backed-resolver-boundary","hns-delegating-resolver-boundary","hns-proof-backed-ns-address-hydration","hns-authoritative-dnssec-delegated-resolver","android-hns-doh-compat-resolver","dns-wire","dns-svcb-https","dnssec-ds-dnskey-link","dnssec-ds-sha1","dnssec-ds-sha384","dnssec-rrsig-signed-data","dnssec-canonical-name-rdata","dnssec-ecdsa-p256-verify","dnssec-ecdsa-p384-verify","dnssec-rsa-sha1-verify","dnssec-rsa-sha256-sha512-verify","dnssec-ed25519-verify","dnssec-signed-rrset-validation","dnssec-delegated-chain-validation","dnssec-delegated-no-data-validation","dnssec-delegated-name-error-validation","dnssec-delegated-cname-chain","dnssec-child-referral-validation","dnssec-child-cname-chain","dnssec-child-no-data-validation","dnssec-child-name-error-validation","dnssec-nsec-denial-validation","dnssec-nsec3-denial-validation","dnssec-nxdomain-name-error-validation","dane-policy","dane-certificate-chain-policy","x509-spki-extraction","p2p-codec","p2p-tcp-peer-connection","p2p-static-peer-source","p2p-dns-seed-source","p2p-getaddr-peer-discovery","p2p-discovery-rotation","p2p-peer-diversity","p2p-sqlite-peer-store","sync-coordinator","sync-header-runner","sync-multi-batch-header-runner","sync-parallel-peer-probing","sync-ranged-peer-rotation","sync-proof-scheduler","android-native-sync-once","android-sync-status","android-sync-outcome-status","android-sync-progress-heights","android-sync-high-batch-catchup","android-clear-resolver-cache","android-persistent-gateway-resolver","android-gateway-live-proof-fetch","android-gateway-header-forwarding","android-gateway-range-forwarding","android-gateway-body-forwarding","android-gateway-file-body-stream","android-webview-hns-intercept","android-service-worker-hns-intercept","android-hns-redirect-follow","android-actionable-hns-errors","hns-name-not-found-error","gateway-policy","gateway-hns-address-required","gateway-tlsa-service-scope","gateway-delegated-origin-address-lookup","gateway-origin-address-query","gateway-https-service-query","gateway-svcb-alpn-policy","gateway-actionable-nameserver-errors","gateway-cname-address-routing","android-proxy-gateway-hook","android-random-loopback-proxy-port","android-local-hns-connect-certs","hns-websocket-upgrade-fail-closed","http-origin-transport","http2-origin-transport","http3-origin-transport","http-origin-response-framing","https-rustls-transport","dane-tls-policy"],"securityDefault":"fail-closed"}"#
+    r#"{"core":"hns-browser-rust-core","version":"0.1.5","features":["header-hash","header-pow-validation","header-mainnet-difficulty-retarget","header-canonical-height-index","hns-name-hash","hns-dotted-root-label","urkel-proof-verification","urkel-proof-value-handoff","hns-name-state-resource-extraction","hns-resource-decoder","hns-resource-provider-adapter","hns-memory-resource-provider","hns-sqlite-resource-provider","hns-negative-cache","hns-ttl-cache-lru","hns-resource-cache-stats","hns-resource-cache-eviction","hns-resource-cache-cap-enforcement","hns-resource-cache-chain-anchors","hns-resource-cache-reorg-invalidation","hns-resource-cache-current-tip","hns-proof-backed-resolver-boundary","hns-delegating-resolver-boundary","hns-proof-backed-ns-address-hydration","hns-authoritative-dnssec-delegated-resolver","android-hns-doh-compat-resolver","dns-wire","dns-svcb-https","dnssec-ds-dnskey-link","dnssec-ds-sha1","dnssec-ds-sha384","dnssec-rrsig-signed-data","dnssec-canonical-name-rdata","dnssec-ecdsa-p256-verify","dnssec-ecdsa-p384-verify","dnssec-rsa-sha1-verify","dnssec-rsa-sha256-sha512-verify","dnssec-ed25519-verify","dnssec-signed-rrset-validation","dnssec-delegated-chain-validation","dnssec-delegated-no-data-validation","dnssec-delegated-name-error-validation","dnssec-delegated-cname-chain","dnssec-child-referral-validation","dnssec-child-cname-chain","dnssec-child-no-data-validation","dnssec-child-name-error-validation","dnssec-nsec-denial-validation","dnssec-nsec3-denial-validation","dnssec-nxdomain-name-error-validation","dane-policy","dane-certificate-chain-policy","x509-spki-extraction","p2p-codec","p2p-tcp-peer-connection","p2p-static-peer-source","p2p-dns-seed-source","p2p-getaddr-peer-discovery","p2p-discovery-rotation","p2p-peer-diversity","p2p-sqlite-peer-store","sync-coordinator","sync-header-runner","sync-multi-batch-header-runner","sync-parallel-peer-probing","sync-ranged-peer-rotation","sync-proof-scheduler","android-native-sync-once","android-sync-status","android-sync-outcome-status","android-sync-progress-heights","android-sync-high-batch-catchup","android-clear-resolver-cache","android-persistent-gateway-resolver","android-gateway-live-proof-fetch","android-gateway-header-forwarding","android-gateway-range-forwarding","android-gateway-body-forwarding","android-gateway-file-body-stream","android-webview-hns-intercept","android-service-worker-hns-intercept","android-hns-redirect-follow","android-actionable-hns-errors","hns-name-not-found-error","gateway-policy","gateway-hns-address-required","gateway-tlsa-service-scope","gateway-delegated-origin-address-lookup","gateway-origin-address-query","gateway-https-service-query","gateway-svcb-alpn-policy","gateway-actionable-nameserver-errors","gateway-cname-address-routing","android-proxy-gateway-hook","android-random-loopback-proxy-port","android-local-hns-connect-certs","hns-websocket-native-tunnel","http-origin-transport","http-origin-connection-pooling","http2-origin-transport","http3-origin-transport","http-origin-response-framing","https-rustls-transport","https-tls-session-resumption","https-alt-svc-promotion","dane-tls-policy"],"securityDefault":"fail-closed"}"#
     .replace("\"version\":\"0.1.5\"", "\"version\":\"0.2.2\"")
 }
 
@@ -976,6 +1077,195 @@ pub fn gateway_http_response_body_to_file(
     }
 }
 
+pub fn gateway_http_upgrade_tunnel(
+    input: GatewayHttpRequestInput<'_>,
+    mut client_input: impl Read + Send + 'static,
+    mut client_output: impl Write + Send + 'static,
+) -> bool {
+    let parsed_headers = match parse_gateway_headers(input.header_text) {
+        Ok(headers) => headers,
+        Err(error) => {
+            return write_tunnel_response(
+                &mut client_output,
+                &plain_response_for_request(&input, 400, "Bad Request", error),
+            );
+        }
+    };
+    let mode = GatewayResolutionMode::from_strict_hns_mode(parsed_headers.strict_hns_mode);
+    let request = gateway_request(&input, parsed_headers.headers);
+    let dns_trace = DnsTraceRecorder::default();
+
+    let base = Path::new(input.data_dir).join("hns");
+    if let Err(error) = fs::create_dir_all(&base) {
+        return write_tunnel_response(
+            &mut client_output,
+            &plain_response_for_request(
+                &input,
+                500,
+                "Gateway Storage Error",
+                &format!("create gateway directory: {error}"),
+            ),
+        );
+    }
+    let values = match SqliteResourceValueProvider::open(base.join("resources.sqlite")) {
+        Ok(values) => values,
+        Err(error) => {
+            return write_tunnel_response(
+                &mut client_output,
+                &plain_response_for_request(
+                    &input,
+                    500,
+                    "Gateway Storage Error",
+                    &format!("open resource cache: {error}"),
+                ),
+            );
+        }
+    };
+    let fallback_marker = FallbackMarker::default();
+    let resolver = android_gateway_resolver(
+        base.clone(),
+        values,
+        mode,
+        fallback_marker.clone(),
+        dns_trace.clone(),
+    );
+    let gateway = match Gateway::new(
+        GatewayConfig {
+            hns_https_mode: HnsHttpsMode::Compatibility,
+            ..GatewayConfig::default()
+        },
+        resolver,
+        TcpHttpTransport::default(),
+    ) {
+        Ok(gateway) => gateway,
+        Err(error) => {
+            return write_tunnel_response(
+                &mut client_output,
+                &plain_response_for_request(
+                    &input,
+                    500,
+                    "Gateway Configuration Error",
+                    &error.to_string(),
+                ),
+            );
+        }
+    };
+
+    match gateway.handle_tunnel(&request) {
+        Ok(response) => {
+            let resolver_policy = fallback_marker.used().then_some("hns-doh-compat");
+            let trace = resolution_trace_json(
+                &input,
+                mode,
+                Some(&response.resolution),
+                TlsTraceInput {
+                    validation: Some(&response.origin_request.tls),
+                    decision: Some(&response.origin.dane_decision),
+                    inspection: response.origin.tls_inspection.as_ref(),
+                },
+                None,
+                &fallback_marker,
+                &dns_trace,
+            );
+            let response_head = upgrade_response_head_with_resolver_policy_and_trace(
+                &response.origin.response_head,
+                &response.origin.dane_decision,
+                resolver_policy,
+                &trace,
+            );
+            if !write_tunnel_response(&mut client_output, &response_head) {
+                return false;
+            }
+
+            let origin = Arc::new(Mutex::new(response.origin.stream));
+            let done = Arc::new(AtomicBool::new(false));
+            let origin_writer = Arc::clone(&origin);
+            let writer_done = Arc::clone(&done);
+            let _client_to_origin = thread::spawn(move || {
+                let _ = copy_client_to_origin(&mut client_input, origin_writer);
+                writer_done.store(true, Ordering::SeqCst);
+            });
+            let result = copy_origin_to_client(origin, &mut client_output, Arc::clone(&done));
+            done.store(true, Ordering::SeqCst);
+            result.is_ok()
+        }
+        Err(error) => {
+            let (status, reason, detail) = map_gateway_error(&error);
+            let trace = resolution_trace_json(
+                &input,
+                mode,
+                None,
+                TlsTraceInput::default(),
+                Some(&error),
+                &fallback_marker,
+                &dns_trace,
+            );
+            write_tunnel_response(
+                &mut client_output,
+                &plain_response_for_request_with_trace(&input, status, reason, detail, &trace),
+            )
+        }
+    }
+}
+
+fn write_tunnel_response(output: &mut impl Write, bytes: &[u8]) -> bool {
+    output.write_all(bytes).and_then(|_| output.flush()).is_ok()
+}
+
+fn copy_client_to_origin(
+    client_input: &mut impl Read,
+    origin: Arc<Mutex<Box<dyn ReadWrite>>>,
+) -> std::io::Result<()> {
+    let mut buffer = [0u8; TUNNEL_COPY_BUFFER_BYTES];
+    loop {
+        let read = match client_input.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(read) => read,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        let mut origin = origin
+            .lock()
+            .map_err(|_| std::io::Error::other("origin tunnel lock is poisoned"))?;
+        origin.write_all(&buffer[..read])?;
+        origin.flush()?;
+    }
+}
+
+fn copy_origin_to_client(
+    origin: Arc<Mutex<Box<dyn ReadWrite>>>,
+    client_output: &mut impl Write,
+    done: Arc<AtomicBool>,
+) -> std::io::Result<()> {
+    let mut buffer = [0u8; TUNNEL_COPY_BUFFER_BYTES];
+    loop {
+        let read = {
+            let mut origin = origin
+                .lock()
+                .map_err(|_| std::io::Error::other("origin tunnel lock is poisoned"))?;
+            match origin.read(&mut buffer) {
+                Ok(0) => return Ok(()),
+                Ok(read) => Some(read),
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) =>
+                {
+                    None
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => None,
+                Err(error) => return Err(error),
+            }
+        };
+        let Some(read) = read else {
+            if done.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            continue;
+        };
+        client_output.write_all(&buffer[..read])?;
+        client_output.flush()?;
+    }
+}
+
 fn gateway_request(
     input: &GatewayHttpRequestInput<'_>,
     headers: Vec<(String, String)>,
@@ -989,7 +1279,9 @@ fn gateway_request(
             port: input.port,
             path_and_query: input.path_and_query.to_owned(),
             protocol: OriginProtocol::Http11,
-            tls: if input.scheme.eq_ignore_ascii_case("https") {
+            tls: if input.scheme.eq_ignore_ascii_case("https")
+                || input.scheme.eq_ignore_ascii_case("wss")
+            {
                 TlsValidation::hns_compatibility(false, Vec::new())
             } else {
                 TlsValidation::default()
@@ -1118,6 +1410,46 @@ fn origin_response_head_with_resolver_policy_and_trace(
         out.extend(format!("{name}: {value}\r\n").as_bytes());
     }
     if let Some(policy) = hns_tls_policy_header(&response.dane_decision) {
+        out.extend(format!("X-HNS-TLS-Policy: {policy}\r\n").as_bytes());
+    }
+    if let Some(policy) = resolver_policy {
+        out.extend(format!("X-HNS-Resolver-Policy: {policy}\r\n").as_bytes());
+    }
+    out.extend(format!("{HNS_RESOLVER_MODE_HEADER}: {}\r\n", trace_mode(trace_json)).as_bytes());
+    out.extend(
+        format!(
+            "{HNS_DOH_FALLBACK_HEADER}: {}\r\n",
+            trace_doh_fallback(trace_json)
+        )
+        .as_bytes(),
+    );
+    out.extend(format!("{HNS_RESOLUTION_TRACE_HEADER}: {trace_json}\r\n").as_bytes());
+    out.extend(b"\r\n");
+    out
+}
+
+fn upgrade_response_head_with_resolver_policy_and_trace(
+    response_head: &[u8],
+    decision: &DaneDecision,
+    resolver_policy: Option<&str>,
+    trace_json: &str,
+) -> Vec<u8> {
+    let header_text = String::from_utf8_lossy(response_head);
+    let header_text = header_text.strip_suffix("\r\n\r\n").unwrap_or(&header_text);
+    let mut lines = header_text.split("\r\n");
+    let status_line = lines.next().unwrap_or("HTTP/1.1 101 Switching Protocols");
+    let mut out = format!("{status_line}\r\n").into_bytes();
+    for line in lines.filter(|line| !line.is_empty()) {
+        let Some((name, _)) = line.split_once(':') else {
+            continue;
+        };
+        if suppressed_origin_response_header(name.trim()) {
+            continue;
+        }
+        out.extend(line.as_bytes());
+        out.extend(b"\r\n");
+    }
+    if let Some(policy) = hns_tls_policy_header(decision) {
         out.extend(format!("X-HNS-TLS-Policy: {policy}\r\n").as_bytes());
     }
     if let Some(policy) = resolver_policy {
@@ -1988,7 +2320,7 @@ fn map_gateway_error(error: &GatewayError) -> (u16, &'static str, &'static str) 
         GatewayError::Transport(TransportError::UnsupportedUpgrade) => (
             501,
             "HNS Protocol Upgrade Unsupported",
-            "HNS WebSocket/HTTP Upgrade requires native stream tunneling and currently fails closed.",
+            "HNS WebSocket/HTTP Upgrade must use the native tunnel path and the request failed validation.",
         ),
         GatewayError::Transport(TransportError::ResponseTooLarge) => (
             502,
@@ -2210,7 +2542,7 @@ fn plain_response_body(status: u16, reason: &str, detail: &str, address: Option<
 fn gateway_request_address(input: &GatewayHttpRequestInput<'_>) -> String {
     let scheme = input.scheme.to_ascii_lowercase();
     let port = match (scheme.as_str(), input.port) {
-        ("http", 80) | ("https", 443) => String::new(),
+        ("http" | "ws", 80) | ("https" | "wss", 443) => String::new(),
         (_, port) => format!(":{port}"),
     };
     let path = if input.path_and_query.is_empty() {
@@ -2828,6 +3160,38 @@ pub extern "system" fn Java_com_handshake_browser_net_NativeBridge_nativeGateway
     }
 }
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_handshake_browser_net_NativeBridge_nativeGatewayHttpUpgradeTunnel(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    data_dir: JString<'_>,
+    method: JString<'_>,
+    scheme: JString<'_>,
+    host: JString<'_>,
+    port: jint,
+    path_and_query: JString<'_>,
+    header_text: JString<'_>,
+    client_input: JObject<'_>,
+    client_output: JObject<'_>,
+) -> jboolean {
+    if jni_gateway_http_upgrade_tunnel(
+        &mut env,
+        data_dir,
+        method,
+        scheme,
+        host,
+        port,
+        path_and_query,
+        header_text,
+        client_input,
+        client_output,
+    ) {
+        1
+    } else {
+        0
+    }
+}
+
 fn jni_gateway_http_response(
     env: &mut JNIEnv<'_>,
     input: JniGatewayHttpRequest<'_>,
@@ -2932,6 +3296,76 @@ fn jni_gateway_http_response_body_to_file(
         Path::new(&output_path),
     )
     .ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn jni_gateway_http_upgrade_tunnel(
+    env: &mut JNIEnv<'_>,
+    data_dir: JString<'_>,
+    method: JString<'_>,
+    scheme: JString<'_>,
+    host: JString<'_>,
+    port: jint,
+    path_and_query: JString<'_>,
+    header_text: JString<'_>,
+    client_input: JObject<'_>,
+    client_output: JObject<'_>,
+) -> bool {
+    let data_dir = match env.get_string(&data_dir) {
+        Ok(value) => value.to_string_lossy().into_owned(),
+        Err(_) => return false,
+    };
+    let method = match env.get_string(&method) {
+        Ok(value) => value.to_string_lossy().into_owned(),
+        Err(_) => return false,
+    };
+    let scheme = match env.get_string(&scheme) {
+        Ok(value) => value.to_string_lossy().into_owned(),
+        Err(_) => return false,
+    };
+    let host = match env.get_string(&host) {
+        Ok(value) => value.to_string_lossy().into_owned(),
+        Err(_) => return false,
+    };
+    let path_and_query = match env.get_string(&path_and_query) {
+        Ok(value) => value.to_string_lossy().into_owned(),
+        Err(_) => return false,
+    };
+    let header_text = match env.get_string(&header_text) {
+        Ok(value) => value.to_string_lossy().into_owned(),
+        Err(_) => return false,
+    };
+    let port = match u16::try_from(port) {
+        Ok(port) => port,
+        Err(_) => return false,
+    };
+    let vm = match env.get_java_vm() {
+        Ok(vm) => Arc::new(vm),
+        Err(_) => return false,
+    };
+    let client_input = match env.new_global_ref(&client_input) {
+        Ok(stream) => stream,
+        Err(_) => return false,
+    };
+    let client_output = match env.new_global_ref(&client_output) {
+        Ok(stream) => stream,
+        Err(_) => return false,
+    };
+
+    gateway_http_upgrade_tunnel(
+        GatewayHttpRequestInput {
+            data_dir: &data_dir,
+            method: &method,
+            scheme: &scheme,
+            host: &host,
+            port,
+            path_and_query: &path_and_query,
+            header_text: &header_text,
+            body: &[],
+        },
+        JavaInputStream::new(Arc::clone(&vm), client_input),
+        JavaOutputStream::new(vm, client_output),
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -3143,8 +3577,13 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_reports_websocket_upgrade_fail_closed() {
-        assert!(diagnostics_json().contains(r#""hns-websocket-upgrade-fail-closed""#));
+    fn diagnostics_reports_websocket_native_tunnel() {
+        let diagnostics = diagnostics_json();
+
+        assert!(diagnostics.contains(r#""hns-websocket-native-tunnel""#));
+        assert!(diagnostics.contains(r#""http-origin-connection-pooling""#));
+        assert!(diagnostics.contains(r#""https-tls-session-resumption""#));
+        assert!(diagnostics.contains(r#""https-alt-svc-promotion""#));
     }
 
     #[test]

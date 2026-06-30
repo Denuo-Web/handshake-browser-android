@@ -391,12 +391,12 @@ impl TcpHttpTransport {
         let (config, verifier) = self.client_config(request.tls.clone(), Vec::new())?;
         let server_name = ServerName::try_from(request.host.clone())
             .map_err(|_| TransportError::InvalidRequest)?;
-        verifier.begin_handshake();
+        verifier.begin_handshake(&request.host);
         let connection = ClientConnection::new(Arc::new(config), server_name).map_err(tls_error)?;
         let mut tls_stream = StreamOwned::new(connection, stream);
 
         let (mut head, reusable) = self.send_tls_http11(&mut tls_stream, request, body)?;
-        let (dane_decision, tls_inspection) = verifier.finish_handshake()?;
+        let (dane_decision, tls_inspection) = verifier.finish_handshake(&request.host)?;
         head.dane_decision = dane_decision.clone();
         head.tls_inspection = tls_inspection.clone();
         if reusable {
@@ -463,7 +463,7 @@ impl TcpHttpTransport {
         let server_name = ServerName::try_from(request.host.clone())
             .map_err(|_| TransportError::InvalidRequest)?;
         let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-        verifier.begin_handshake();
+        verifier.begin_handshake(&request.host);
         let tls_stream = connector
             .connect(server_name, stream)
             .await
@@ -508,7 +508,7 @@ impl TcpHttpTransport {
         }
         connection_task.abort();
 
-        let (dane_decision, tls_inspection) = verifier.finish_handshake()?;
+        let (dane_decision, tls_inspection) = verifier.finish_handshake(&request.host)?;
         Ok(OriginResponseHead {
             status,
             headers,
@@ -570,7 +570,7 @@ impl TcpHttpTransport {
         let connecting = endpoint
             .connect(remote, &request.host)
             .map_err(quic_error)?;
-        verifier.begin_handshake();
+        verifier.begin_handshake(&request.host);
         let connection = http3_timeout(self.connect_timeout, "connect", connecting)
             .await?
             .map_err(quic_error)?;
@@ -643,7 +643,7 @@ impl TcpHttpTransport {
         driver_task.abort();
         close_connection.close(0u32.into(), b"done");
 
-        let (dane_decision, tls_inspection) = verifier.finish_handshake()?;
+        let (dane_decision, tls_inspection) = verifier.finish_handshake(&request.host)?;
         Ok(OriginResponseHead {
             status,
             headers,
@@ -704,7 +704,7 @@ impl TcpHttpTransport {
         let (config, verifier) = self.client_config(request.tls.clone(), Vec::new())?;
         let server_name = ServerName::try_from(request.host.clone())
             .map_err(|_| TransportError::InvalidRequest)?;
-        verifier.begin_handshake();
+        verifier.begin_handshake(&request.host);
         let connection = ClientConnection::new(Arc::new(config), server_name).map_err(tls_error)?;
         let mut tls_stream = StreamOwned::new(connection, stream);
         let response_head = self.send_http11_upgrade(&mut tls_stream, request)?;
@@ -712,7 +712,7 @@ impl TcpHttpTransport {
             .sock
             .set_read_timeout(Some(TUNNEL_READ_TIMEOUT))
             .map_err(io_error)?;
-        let (dane_decision, tls_inspection) = verifier.finish_handshake()?;
+        let (dane_decision, tls_inspection) = verifier.finish_handshake(&request.host)?;
         Ok(OriginTunnel {
             response_head,
             stream: Box::new(tls_stream),
@@ -975,11 +975,12 @@ struct DaneServerCertVerifier {
     webpki: Arc<WebPkiServerVerifier>,
     tls: TlsValidation,
     handshakes: Mutex<HashMap<ThreadId, HandshakeCapture>>,
-    last_success: Mutex<Option<HandshakeCapture>>,
+    last_success: Mutex<HashMap<String, HandshakeCapture>>,
 }
 
 #[derive(Clone, Debug, Default)]
 struct HandshakeCapture {
+    server_name: String,
     decision: Option<DaneDecision>,
     inspection: Option<TlsCertificateInspection>,
 }
@@ -990,18 +991,25 @@ impl DaneServerCertVerifier {
             webpki,
             tls,
             handshakes: Mutex::new(HashMap::new()),
-            last_success: Mutex::new(None),
+            last_success: Mutex::new(HashMap::new()),
         }
     }
 
-    fn begin_handshake(&self) {
+    fn begin_handshake(&self, server_name: &str) {
         if let Ok(mut handshakes) = self.handshakes.lock() {
-            handshakes.insert(std::thread::current().id(), HandshakeCapture::default());
+            handshakes.insert(
+                std::thread::current().id(),
+                HandshakeCapture {
+                    server_name: server_name.to_ascii_lowercase(),
+                    ..HandshakeCapture::default()
+                },
+            );
         }
     }
 
     fn finish_handshake(
         &self,
+        server_name: &str,
     ) -> Result<(DaneDecision, Option<TlsCertificateInspection>), TransportError> {
         let capture = self
             .handshakes
@@ -1014,11 +1022,13 @@ impl DaneServerCertVerifier {
             return Ok((decision, capture.inspection));
         }
 
+        let key = server_name.to_ascii_lowercase();
         let cached = self
             .last_success
             .lock()
             .map_err(|_| TransportError::Tls("TLS handshake cache lock is poisoned".to_owned()))?
-            .clone()
+            .get(&key)
+            .cloned()
             .ok_or_else(|| {
                 TransportError::Tls("TLS certificate policy was not evaluated".to_owned())
             })?;
@@ -1035,20 +1045,21 @@ impl DaneServerCertVerifier {
         decision: DaneDecision,
         inspection: TlsCertificateInspection,
     ) -> Result<(), RustlsError> {
-        let capture = HandshakeCapture {
-            decision: Some(decision),
-            inspection: Some(inspection),
-        };
         let mut handshakes = self
             .handshakes
             .lock()
             .map_err(|_| RustlsError::General("TLS handshake lock is poisoned".to_owned()))?;
-        handshakes.insert(std::thread::current().id(), capture.clone());
+        let capture = handshakes.entry(std::thread::current().id()).or_default();
+        capture.decision = Some(decision);
+        capture.inspection = Some(inspection);
+        let capture = capture.clone();
         let mut last_success = self
             .last_success
             .lock()
             .map_err(|_| RustlsError::General("TLS handshake cache lock is poisoned".to_owned()))?;
-        *last_success = Some(capture);
+        if !capture.server_name.is_empty() {
+            last_success.insert(capture.server_name.clone(), capture);
+        }
         Ok(())
     }
 }

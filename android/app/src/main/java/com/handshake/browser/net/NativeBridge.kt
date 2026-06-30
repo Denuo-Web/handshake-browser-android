@@ -1,6 +1,8 @@
 package com.handshake.browser.net
 
 import java.io.File
+import java.io.InputStream
+import java.io.OutputStream
 
 interface HnsGatewayBridge {
     fun httpResponse(
@@ -24,6 +26,18 @@ interface HnsGatewayBridge {
         headers: List<Pair<String, String>>,
         body: ByteArray,
     ): HnsGatewayFileResponse? = null
+
+    fun httpUpgradeTunnel(
+        dataDir: String,
+        method: String,
+        scheme: String,
+        host: String,
+        port: Int,
+        pathAndQuery: String,
+        headers: List<Pair<String, String>>,
+        clientInput: InputStream,
+        clientOutput: OutputStream,
+    ): Boolean = false
 }
 
 interface HnsSyncBridge {
@@ -170,6 +184,28 @@ object NativeBridge : HnsGatewayBridge, HnsSyncBridge, LocalTlsCertificateProvid
         return HnsGatewayFileResponse(head, bodyFile)
     }
 
+    override fun httpUpgradeTunnel(
+        dataDir: String,
+        method: String,
+        scheme: String,
+        host: String,
+        port: Int,
+        pathAndQuery: String,
+        headers: List<Pair<String, String>>,
+        clientInput: InputStream,
+        clientOutput: OutputStream,
+    ): Boolean = isLoaded && nativeGatewayHttpUpgradeTunnel(
+        dataDir,
+        method,
+        scheme,
+        host,
+        port,
+        pathAndQuery,
+        serializeHeaders(headers),
+        clientInput,
+        clientOutput,
+    )
+
     private external fun nativeVersion(): String
 
     private external fun nativeDiagnostics(): String
@@ -206,6 +242,18 @@ object NativeBridge : HnsGatewayBridge, HnsSyncBridge, LocalTlsCertificateProvid
         body: ByteArray,
         bodyPath: String,
     ): ByteArray?
+
+    private external fun nativeGatewayHttpUpgradeTunnel(
+        dataDir: String,
+        method: String,
+        scheme: String,
+        host: String,
+        port: Int,
+        pathAndQuery: String,
+        headerText: String,
+        clientInput: InputStream,
+        clientOutput: OutputStream,
+    ): Boolean
 
     private fun serializeHeaders(headers: List<Pair<String, String>>): String = buildString {
         headers.forEach { (name, value) ->
