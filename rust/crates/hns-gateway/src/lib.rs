@@ -7,7 +7,7 @@ use hns_dane::{DaneError, DomainTrustMode, TlsaRecord};
 use hns_resolver::{ResolutionAnswer, ResolutionRequest, Resolver, ResolverError, hns_root_label};
 use hns_transport::{
     OriginProtocol, OriginRequest, OriginResponse, OriginResponseHead, OriginTransport,
-    TransportError,
+    OriginTunnel, TransportError,
 };
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -48,6 +48,12 @@ pub struct GatewayResponseHead {
     pub resolution: ResolutionAnswer,
     pub origin_request: OriginRequest,
     pub origin: OriginResponseHead,
+}
+
+pub struct GatewayTunnel {
+    pub resolution: ResolutionAnswer,
+    pub origin_request: OriginRequest,
+    pub origin: OriginTunnel,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -119,7 +125,8 @@ where
     }
 
     pub fn handle(&self, request: &GatewayRequest) -> Result<GatewayResponse, GatewayError> {
-        let (resolution, origin_request) = self.resolve_origin_request(request)?;
+        let (resolution, origin_request) =
+            self.resolve_origin_request(request, &self.config.supported_origin_protocols)?;
         let origin = self.transport.fetch(&origin_request)?;
         Ok(GatewayResponse {
             resolution,
@@ -133,9 +140,21 @@ where
         request: &GatewayRequest,
         body: &mut dyn Write,
     ) -> Result<GatewayResponseHead, GatewayError> {
-        let (resolution, origin_request) = self.resolve_origin_request(request)?;
+        let (resolution, origin_request) =
+            self.resolve_origin_request(request, &self.config.supported_origin_protocols)?;
         let origin = self.transport.fetch_to_writer(&origin_request, body)?;
         Ok(GatewayResponseHead {
+            resolution,
+            origin_request,
+            origin,
+        })
+    }
+
+    pub fn handle_tunnel(&self, request: &GatewayRequest) -> Result<GatewayTunnel, GatewayError> {
+        let (resolution, origin_request) =
+            self.resolve_origin_request(request, &[OriginProtocol::Http11])?;
+        let origin = self.transport.open_tunnel(&origin_request)?;
+        Ok(GatewayTunnel {
             resolution,
             origin_request,
             origin,
@@ -153,6 +172,7 @@ where
     fn resolve_origin_request(
         &self,
         request: &GatewayRequest,
+        supported_origin_protocols: &[OriginProtocol],
     ) -> Result<(ResolutionAnswer, OriginRequest), GatewayError> {
         if !hosts_match(&request.origin.host, &request.resolution.qname) {
             return Err(GatewayError::HostResolutionMismatch);
@@ -178,14 +198,14 @@ where
                 return Err(GatewayError::NoResolvedAddress);
             }
         }
-        if origin_request.scheme.eq_ignore_ascii_case("https") {
+        if is_tls_origin_scheme(&origin_request.scheme) {
             origin_request.tls.mode = self.config.hns_https_mode.domain_trust_mode();
             if !apply_https_service_policy(
                 &resolution.records,
                 &mut origin_request,
-                &self.config.supported_origin_protocols,
+                supported_origin_protocols,
             )? {
-                self.resolve_https_service_policy(&mut origin_request)?;
+                self.resolve_https_service_policy(&mut origin_request, supported_origin_protocols)?;
             }
             let (tlsa_secure, tlsa_records) =
                 self.resolve_tlsa_records(&origin_request.host, origin_request.port)?;
@@ -236,6 +256,7 @@ where
     fn resolve_https_service_policy(
         &self,
         request: &mut OriginRequest,
+        supported_origin_protocols: &[OriginProtocol],
     ) -> Result<(), GatewayError> {
         let answer = self.resolver.resolve(&ResolutionRequest {
             qname: normalize_host(&request.host),
@@ -244,11 +265,7 @@ where
         if self.config.require_secure_resolution && !answer.secure {
             return Err(GatewayError::InsecureResolution);
         }
-        apply_https_service_policy(
-            &answer.records,
-            request,
-            &self.config.supported_origin_protocols,
-        )?;
+        apply_https_service_policy(&answer.records, request, supported_origin_protocols)?;
         Ok(())
     }
 }
@@ -276,6 +293,10 @@ fn normalize_host(host: &str) -> String {
         .next()
         .unwrap_or_default()
         .to_owned()
+}
+
+fn is_tls_origin_scheme(scheme: &str) -> bool {
+    scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("wss")
 }
 
 fn first_resolved_address(records: &[ResourceRecord], host: &str) -> Option<String> {
@@ -476,7 +497,10 @@ mod tests {
     use hns_core::dns::{DnsName, RecordType, ResourceRecord};
     use hns_dane::{DaneDecision, DaneError, TlsaMatching, TlsaSelector, TlsaUsage};
     use hns_resolver::{ResolutionAnswer, Resolver};
-    use hns_transport::{OriginProtocol, OriginResponse, OriginTransport, TlsValidation};
+    use hns_transport::{
+        OriginProtocol, OriginResponse, OriginTransport, OriginTunnel, TlsValidation,
+    };
+    use std::io::Cursor;
     use std::sync::{Arc, Mutex};
 
     struct StaticResolver {
@@ -527,6 +551,7 @@ mod tests {
     #[derive(Default)]
     struct CapturingTransport {
         last_request: Mutex<Option<OriginRequest>>,
+        last_tunnel_request: Mutex<Option<OriginRequest>>,
     }
 
     impl OriginTransport for CapturingTransport {
@@ -536,6 +561,16 @@ mod tests {
                 status: 200,
                 headers: Vec::new(),
                 body: b"ok".to_vec(),
+                dane_decision: DaneDecision::NoTlsa,
+                tls_inspection: None,
+            })
+        }
+
+        fn open_tunnel(&self, request: &OriginRequest) -> Result<OriginTunnel, TransportError> {
+            *self.last_tunnel_request.lock().unwrap() = Some(request.clone());
+            Ok(OriginTunnel {
+                response_head: b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n".to_vec(),
+                stream: Box::new(Cursor::new(Vec::<u8>::new())),
                 dane_decision: DaneDecision::NoTlsa,
                 tls_inspection: None,
             })
@@ -1129,6 +1164,103 @@ mod tests {
                     qtype: RecordType::Tlsa.code(),
                 },
             ],
+        );
+    }
+
+    #[test]
+    fn wss_tunnel_uses_hns_tls_policy_and_tlsa_records() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let gateway = Gateway::new(
+            GatewayConfig::default(),
+            ScriptedResolver::new(
+                vec![
+                    response("name", RecordType::A.code(), true, vec![address_record()]),
+                    response("name", RecordType::Https.code(), true, vec![]),
+                    response(
+                        "_443._tcp.name",
+                        RecordType::Tlsa.code(),
+                        true,
+                        vec![tlsa_record("_443._tcp.name", vec![3, 1, 0, 0xaa])],
+                    ),
+                ],
+                Arc::clone(&requests),
+            ),
+            CapturingTransport::default(),
+        )
+        .unwrap();
+        let mut request = request("name", "name");
+        request.origin.scheme = "wss".to_owned();
+        request.origin.headers = vec![
+            ("Connection".to_owned(), "Upgrade".to_owned()),
+            ("Upgrade".to_owned(), "websocket".to_owned()),
+        ];
+
+        gateway.handle_tunnel(&request).unwrap();
+
+        let captured = gateway
+            .transport()
+            .last_tunnel_request
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        assert_eq!(captured.scheme, "wss");
+        assert_eq!(captured.protocol, OriginProtocol::Http11);
+        assert_eq!(captured.tls.mode, DomainTrustMode::HnsStrict);
+        assert!(captured.tls.dnssec_secure);
+        assert_eq!(captured.tls.tlsa_records.len(), 1);
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|request| request.qtype)
+                .collect::<Vec<_>>(),
+            vec![
+                RecordType::A.code(),
+                RecordType::Https.code(),
+                RecordType::Tlsa.code(),
+            ],
+        );
+    }
+
+    #[test]
+    fn wss_tunnel_rejects_https_service_without_http11() {
+        let gateway = Gateway::new(
+            GatewayConfig::default(),
+            StaticResolver {
+                secure: true,
+                records: vec![
+                    address_record(),
+                    https_record(
+                        "name",
+                        1,
+                        ".",
+                        vec![alpn_param(&[b"h2"]), no_default_alpn_param()],
+                    ),
+                ],
+            },
+            CapturingTransport::default(),
+        )
+        .unwrap();
+        let mut request = request("name", "name");
+        request.origin.scheme = "wss".to_owned();
+        request.origin.headers = vec![
+            ("Connection".to_owned(), "Upgrade".to_owned()),
+            ("Upgrade".to_owned(), "websocket".to_owned()),
+        ];
+
+        assert_eq!(
+            gateway.handle_tunnel(&request).err().unwrap(),
+            GatewayError::UnsupportedSvcb,
+        );
+        assert!(
+            gateway
+                .transport()
+                .last_tunnel_request
+                .lock()
+                .unwrap()
+                .is_none()
         );
     }
 

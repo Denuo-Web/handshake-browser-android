@@ -4,18 +4,25 @@ use hns_dane::{
     WebPkiStatus, evaluate_policy_with_certificate_chain, extract_spki_der,
 };
 use http::{HeaderName, HeaderValue, Request as Http2Request};
-use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::{Resumption, WebPkiServerVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{
     ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, SignatureScheme,
 };
 use rustls::{Error as RustlsError, StreamOwned};
+use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::net::{Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::thread::ThreadId;
+use std::time::{Duration, Instant};
 use thiserror::Error;
+
+const MAX_HTTP11_POOL_PER_ORIGIN: usize = 2;
+const MAX_ALT_SVC_AGE_SECS: u64 = 24 * 60 * 60;
+const TUNNEL_READ_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OriginProtocol {
@@ -113,6 +120,10 @@ pub enum TransportError {
 pub trait OriginTransport {
     fn fetch(&self, request: &OriginRequest) -> Result<OriginResponse, TransportError>;
 
+    fn open_tunnel(&self, _request: &OriginRequest) -> Result<OriginTunnel, TransportError> {
+        Err(TransportError::UnsupportedTransport)
+    }
+
     fn fetch_to_writer(
         &self,
         request: &OriginRequest,
@@ -124,6 +135,17 @@ pub trait OriginTransport {
     }
 }
 
+pub trait ReadWrite: Read + Write + Send {}
+
+impl<T: Read + Write + Send> ReadWrite for T {}
+
+pub struct OriginTunnel {
+    pub response_head: Vec<u8>,
+    pub stream: Box<dyn ReadWrite>,
+    pub dane_decision: DaneDecision,
+    pub tls_inspection: Option<TlsCertificateInspection>,
+}
+
 pub struct FailClosedTransport;
 
 #[derive(Clone, Debug)]
@@ -132,6 +154,48 @@ pub struct TcpHttpTransport {
     read_timeout: Duration,
     limits: TransportLimits,
     root_store: Arc<RootCertStore>,
+    state: Arc<Mutex<TransportState>>,
+}
+
+#[derive(Debug, Default)]
+struct TransportState {
+    http11_pool: HashMap<Http11PoolKey, VecDeque<PooledHttp11Connection>>,
+    tls_verifiers: HashMap<String, Arc<DaneServerCertVerifier>>,
+    tls_resumption: HashMap<String, Resumption>,
+    alt_svc: HashMap<AltSvcKey, AltSvcEndpoint>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct Http11PoolKey {
+    scheme: String,
+    host: String,
+    connect_host: String,
+    port: u16,
+    tls_key: String,
+}
+
+#[derive(Debug)]
+enum PooledHttp11Connection {
+    Plain(TcpStream),
+    Tls {
+        stream: StreamOwned<ClientConnection, TcpStream>,
+        dane_decision: DaneDecision,
+        tls_inspection: Option<TlsCertificateInspection>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct AltSvcKey {
+    scheme: String,
+    host: String,
+    port: u16,
+}
+
+#[derive(Clone, Debug)]
+struct AltSvcEndpoint {
+    protocol: OriginProtocol,
+    port: u16,
+    expires_at: Instant,
 }
 
 impl Default for TransportLimits {
@@ -151,6 +215,7 @@ impl Default for TcpHttpTransport {
             read_timeout: Duration::from_secs(30),
             limits: TransportLimits::default(),
             root_store: Arc::new(default_root_store()),
+            state: Arc::new(Mutex::new(TransportState::default())),
         }
     }
 }
@@ -202,6 +267,7 @@ impl TcpHttpTransport {
             read_timeout,
             limits,
             root_store: Arc::new(default_root_store()),
+            state: Arc::new(Mutex::new(TransportState::default())),
         }
     }
 
@@ -216,6 +282,7 @@ impl TcpHttpTransport {
             read_timeout,
             limits,
             root_store: Arc::new(root_store),
+            state: Arc::new(Mutex::new(TransportState::default())),
         }
     }
 
@@ -224,20 +291,15 @@ impl TcpHttpTransport {
     }
 
     fn fetch_http11(&self, request: &OriginRequest) -> Result<OriginResponse, TransportError> {
-        validate_request(request, self.limits)?;
-        let connection_host = request.connect_host.as_deref().unwrap_or(&request.host);
-        let mut stream = connect(connection_host, request.port, self.connect_timeout)?;
-        stream
-            .set_read_timeout(Some(self.read_timeout))
-            .map_err(io_error)?;
-        stream
-            .set_write_timeout(Some(self.read_timeout))
-            .map_err(io_error)?;
-
-        let request_bytes = build_http_request(request)?;
-        stream.write_all(&request_bytes).map_err(io_error)?;
-        stream.flush().map_err(io_error)?;
-        parse_http_response(&mut stream, self.limits, &request.method)
+        let mut body = Vec::new();
+        let head = self.fetch_http11_to_writer(request, &mut body)?;
+        Ok(OriginResponse {
+            status: head.status,
+            headers: head.headers,
+            body,
+            dane_decision: head.dane_decision,
+            tls_inspection: head.tls_inspection,
+        })
     }
 
     fn fetch_http11_to_writer(
@@ -246,61 +308,45 @@ impl TcpHttpTransport {
         body: &mut dyn Write,
     ) -> Result<OriginResponseHead, TransportError> {
         validate_request(request, self.limits)?;
+        let key = self.http11_pool_key(request);
+        if let Some(PooledHttp11Connection::Plain(mut stream)) = self.take_http11_connection(&key) {
+            if let Ok((head, reusable)) = self.send_plain_http11(&mut stream, request, body) {
+                if reusable {
+                    self.put_http11_connection(key, PooledHttp11Connection::Plain(stream));
+                }
+                return Ok(head);
+            }
+        }
+
         let connection_host = request.connect_host.as_deref().unwrap_or(&request.host);
         let mut stream = connect(connection_host, request.port, self.connect_timeout)?;
         stream
-            .set_read_timeout(Some(self.read_timeout))
+            .set_read_timeout(Some(TUNNEL_READ_TIMEOUT))
             .map_err(io_error)?;
         stream
             .set_write_timeout(Some(self.read_timeout))
             .map_err(io_error)?;
 
-        let request_bytes = build_http_request(request)?;
-        stream.write_all(&request_bytes).map_err(io_error)?;
-        stream.flush().map_err(io_error)?;
-        parse_http_response_to_writer(&mut stream, self.limits, &request.method, body)
+        let (head, reusable) = self.send_plain_http11(&mut stream, request, body)?;
+        if reusable {
+            self.put_http11_connection(key, PooledHttp11Connection::Plain(stream));
+        }
+        Ok(head)
     }
 
     fn fetch_https_http11(
         &self,
         request: &OriginRequest,
     ) -> Result<OriginResponse, TransportError> {
-        validate_request(request, self.limits)?;
-        let connection_host = request.connect_host.as_deref().unwrap_or(&request.host);
-        let stream = connect(connection_host, request.port, self.connect_timeout)?;
-        stream
-            .set_read_timeout(Some(self.read_timeout))
-            .map_err(io_error)?;
-        stream
-            .set_write_timeout(Some(self.read_timeout))
-            .map_err(io_error)?;
-
-        let decision = Arc::new(Mutex::new(None));
-        let inspection = Arc::new(Mutex::new(None));
-        let config = self.client_config(
-            request.tls.clone(),
-            Arc::clone(&decision),
-            Arc::clone(&inspection),
-            Vec::new(),
-        )?;
-        let server_name = ServerName::try_from(request.host.clone())
-            .map_err(|_| TransportError::InvalidRequest)?;
-        let connection = ClientConnection::new(Arc::new(config), server_name).map_err(tls_error)?;
-        let mut tls_stream = StreamOwned::new(connection, stream);
-
-        let request_bytes = build_http_request(request)?;
-        tls_stream.write_all(&request_bytes).map_err(io_error)?;
-        tls_stream.flush().map_err(io_error)?;
-        let mut response = parse_http_response(&mut tls_stream, self.limits, &request.method)?;
-        response.dane_decision = decision
-            .lock()
-            .map_err(|_| TransportError::Tls("TLS decision lock is poisoned".to_owned()))?
-            .clone()
-            .ok_or_else(|| {
-                TransportError::Tls("TLS certificate policy was not evaluated".to_owned())
-            })?;
-        response.tls_inspection = tls_inspection(inspection)?;
-        Ok(response)
+        let mut body = Vec::new();
+        let head = self.fetch_https_http11_to_writer(request, &mut body)?;
+        Ok(OriginResponse {
+            status: head.status,
+            headers: head.headers,
+            body,
+            dane_decision: head.dane_decision,
+            tls_inspection: head.tls_inspection,
+        })
     }
 
     fn fetch_https_http11_to_writer(
@@ -309,42 +355,61 @@ impl TcpHttpTransport {
         body: &mut dyn Write,
     ) -> Result<OriginResponseHead, TransportError> {
         validate_request(request, self.limits)?;
+        let key = self.http11_pool_key(request);
+        if let Some(PooledHttp11Connection::Tls {
+            mut stream,
+            dane_decision,
+            tls_inspection,
+        }) = self.take_http11_connection(&key)
+        {
+            if let Ok((mut head, reusable)) = self.send_tls_http11(&mut stream, request, body) {
+                head.dane_decision = dane_decision.clone();
+                head.tls_inspection = tls_inspection.clone();
+                if reusable {
+                    self.put_http11_connection(
+                        key,
+                        PooledHttp11Connection::Tls {
+                            stream,
+                            dane_decision,
+                            tls_inspection,
+                        },
+                    );
+                }
+                return Ok(head);
+            }
+        }
+
         let connection_host = request.connect_host.as_deref().unwrap_or(&request.host);
         let stream = connect(connection_host, request.port, self.connect_timeout)?;
         stream
-            .set_read_timeout(Some(self.read_timeout))
+            .set_read_timeout(Some(TUNNEL_READ_TIMEOUT))
             .map_err(io_error)?;
         stream
             .set_write_timeout(Some(self.read_timeout))
             .map_err(io_error)?;
 
-        let decision = Arc::new(Mutex::new(None));
-        let inspection = Arc::new(Mutex::new(None));
-        let config = self.client_config(
-            request.tls.clone(),
-            Arc::clone(&decision),
-            Arc::clone(&inspection),
-            Vec::new(),
-        )?;
+        let (config, verifier) = self.client_config(request.tls.clone(), Vec::new())?;
         let server_name = ServerName::try_from(request.host.clone())
             .map_err(|_| TransportError::InvalidRequest)?;
+        verifier.begin_handshake();
         let connection = ClientConnection::new(Arc::new(config), server_name).map_err(tls_error)?;
         let mut tls_stream = StreamOwned::new(connection, stream);
 
-        let request_bytes = build_http_request(request)?;
-        tls_stream.write_all(&request_bytes).map_err(io_error)?;
-        tls_stream.flush().map_err(io_error)?;
-        let mut response =
-            parse_http_response_to_writer(&mut tls_stream, self.limits, &request.method, body)?;
-        response.dane_decision = decision
-            .lock()
-            .map_err(|_| TransportError::Tls("TLS decision lock is poisoned".to_owned()))?
-            .clone()
-            .ok_or_else(|| {
-                TransportError::Tls("TLS certificate policy was not evaluated".to_owned())
-            })?;
-        response.tls_inspection = tls_inspection(inspection)?;
-        Ok(response)
+        let (mut head, reusable) = self.send_tls_http11(&mut tls_stream, request, body)?;
+        let (dane_decision, tls_inspection) = verifier.finish_handshake()?;
+        head.dane_decision = dane_decision.clone();
+        head.tls_inspection = tls_inspection.clone();
+        if reusable {
+            self.put_http11_connection(
+                key,
+                PooledHttp11Connection::Tls {
+                    stream: tls_stream,
+                    dane_decision,
+                    tls_inspection,
+                },
+            );
+        }
+        Ok(head)
     }
 
     fn fetch_https_http2(&self, request: &OriginRequest) -> Result<OriginResponse, TransportError> {
@@ -394,17 +459,11 @@ impl TcpHttpTransport {
         let connection_host = request.connect_host.as_deref().unwrap_or(&request.host);
         let stream = connect_async(connection_host, request.port, self.connect_timeout).await?;
 
-        let decision = Arc::new(Mutex::new(None));
-        let inspection = Arc::new(Mutex::new(None));
-        let config = self.client_config(
-            request.tls.clone(),
-            Arc::clone(&decision),
-            Arc::clone(&inspection),
-            vec![b"h2".to_vec()],
-        )?;
+        let (config, verifier) = self.client_config(request.tls.clone(), vec![b"h2".to_vec()])?;
         let server_name = ServerName::try_from(request.host.clone())
             .map_err(|_| TransportError::InvalidRequest)?;
         let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        verifier.begin_handshake();
         let tls_stream = connector
             .connect(server_name, stream)
             .await
@@ -449,12 +508,13 @@ impl TcpHttpTransport {
         }
         connection_task.abort();
 
+        let (dane_decision, tls_inspection) = verifier.finish_handshake()?;
         Ok(OriginResponseHead {
             status,
             headers,
             body_len,
-            dane_decision: tls_decision(decision)?,
-            tls_inspection: tls_inspection(inspection)?,
+            dane_decision,
+            tls_inspection,
         })
     }
 
@@ -500,14 +560,7 @@ impl TcpHttpTransport {
         let connection_host = request.connect_host.as_deref().unwrap_or(&request.host);
         let remote = resolve_socket_addr_async(connection_host, request.port).await?;
 
-        let decision = Arc::new(Mutex::new(None));
-        let inspection = Arc::new(Mutex::new(None));
-        let config = self.client_config(
-            request.tls.clone(),
-            Arc::clone(&decision),
-            Arc::clone(&inspection),
-            vec![b"h3".to_vec()],
-        )?;
+        let (config, verifier) = self.client_config(request.tls.clone(), vec![b"h3".to_vec()])?;
         let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(config)
             .map_err(|error| TransportError::Tls(error.to_string()))?;
         let mut endpoint = quinn::Endpoint::client(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)))
@@ -517,6 +570,7 @@ impl TcpHttpTransport {
         let connecting = endpoint
             .connect(remote, &request.host)
             .map_err(quic_error)?;
+        verifier.begin_handshake();
         let connection = http3_timeout(self.connect_timeout, "connect", connecting)
             .await?
             .map_err(quic_error)?;
@@ -589,44 +643,284 @@ impl TcpHttpTransport {
         driver_task.abort();
         close_connection.close(0u32.into(), b"done");
 
+        let (dane_decision, tls_inspection) = verifier.finish_handshake()?;
         Ok(OriginResponseHead {
             status,
             headers,
             body_len,
-            dane_decision: tls_decision(decision)?,
-            tls_inspection: tls_inspection(inspection)?,
+            dane_decision,
+            tls_inspection,
+        })
+    }
+
+    fn open_http11_tunnel(&self, request: &OriginRequest) -> Result<OriginTunnel, TransportError> {
+        validate_tunnel_request(request, self.limits)?;
+        let scheme = tunnel_origin_scheme(&request.scheme)?;
+        let request = OriginRequest {
+            scheme,
+            protocol: OriginProtocol::Http11,
+            ..request.clone()
+        };
+        match request.scheme.as_str() {
+            "http" => self.open_plain_http11_tunnel(&request),
+            "https" => self.open_tls_http11_tunnel(&request),
+            _ => Err(TransportError::UnsupportedScheme),
+        }
+    }
+
+    fn open_plain_http11_tunnel(
+        &self,
+        request: &OriginRequest,
+    ) -> Result<OriginTunnel, TransportError> {
+        let connection_host = request.connect_host.as_deref().unwrap_or(&request.host);
+        let mut stream = connect(connection_host, request.port, self.connect_timeout)?;
+        stream
+            .set_read_timeout(Some(self.read_timeout))
+            .map_err(io_error)?;
+        stream
+            .set_write_timeout(Some(self.read_timeout))
+            .map_err(io_error)?;
+        let response_head = self.send_http11_upgrade(&mut stream, request)?;
+        Ok(OriginTunnel {
+            response_head,
+            stream: Box::new(stream),
+            dane_decision: DaneDecision::NoTlsa,
+            tls_inspection: None,
+        })
+    }
+
+    fn open_tls_http11_tunnel(
+        &self,
+        request: &OriginRequest,
+    ) -> Result<OriginTunnel, TransportError> {
+        let connection_host = request.connect_host.as_deref().unwrap_or(&request.host);
+        let stream = connect(connection_host, request.port, self.connect_timeout)?;
+        stream
+            .set_read_timeout(Some(self.read_timeout))
+            .map_err(io_error)?;
+        stream
+            .set_write_timeout(Some(self.read_timeout))
+            .map_err(io_error)?;
+        let (config, verifier) = self.client_config(request.tls.clone(), Vec::new())?;
+        let server_name = ServerName::try_from(request.host.clone())
+            .map_err(|_| TransportError::InvalidRequest)?;
+        verifier.begin_handshake();
+        let connection = ClientConnection::new(Arc::new(config), server_name).map_err(tls_error)?;
+        let mut tls_stream = StreamOwned::new(connection, stream);
+        let response_head = self.send_http11_upgrade(&mut tls_stream, request)?;
+        tls_stream
+            .sock
+            .set_read_timeout(Some(TUNNEL_READ_TIMEOUT))
+            .map_err(io_error)?;
+        let (dane_decision, tls_inspection) = verifier.finish_handshake()?;
+        Ok(OriginTunnel {
+            response_head,
+            stream: Box::new(tls_stream),
+            dane_decision,
+            tls_inspection,
         })
     }
 
     fn client_config(
         &self,
         tls: TlsValidation,
-        decision: Arc<Mutex<Option<DaneDecision>>>,
-        inspection: Arc<Mutex<Option<TlsCertificateInspection>>>,
         alpn_protocols: Vec<Vec<u8>>,
-    ) -> Result<ClientConfig, TransportError> {
+    ) -> Result<(ClientConfig, Arc<DaneServerCertVerifier>), TransportError> {
+        let tls_key = tls_validation_key(&tls);
+        let verifier = self.dane_verifier_for(tls.clone(), &tls_key)?;
         let provider = rustls::crypto::ring::default_provider();
-        let webpki = WebPkiServerVerifier::builder_with_provider(
-            Arc::clone(&self.root_store),
-            Arc::new(provider.clone()),
-        )
-        .build()
-        .map_err(|error| TransportError::Tls(error.to_string()))?;
-        let verifier = Arc::new(DaneServerCertVerifier {
-            webpki,
-            tls,
-            decision,
-            inspection,
-        });
 
         let mut config = ClientConfig::builder_with_provider(Arc::new(provider))
             .with_safe_default_protocol_versions()
             .map_err(tls_error)?
             .dangerous()
-            .with_custom_certificate_verifier(verifier)
+            .with_custom_certificate_verifier(verifier.clone())
             .with_no_client_auth();
+        config.resumption = self.resumption_for(&tls_key, &alpn_protocols)?;
         config.alpn_protocols = alpn_protocols;
-        Ok(config)
+        Ok((config, verifier))
+    }
+
+    fn dane_verifier_for(
+        &self,
+        tls: TlsValidation,
+        tls_key: &str,
+    ) -> Result<Arc<DaneServerCertVerifier>, TransportError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| TransportError::Tls("transport state lock is poisoned".to_owned()))?;
+        if let Some(verifier) = state.tls_verifiers.get(tls_key) {
+            return Ok(Arc::clone(verifier));
+        }
+
+        let provider = rustls::crypto::ring::default_provider();
+        let webpki = WebPkiServerVerifier::builder_with_provider(
+            Arc::clone(&self.root_store),
+            Arc::new(provider),
+        )
+        .build()
+        .map_err(|error| TransportError::Tls(error.to_string()))?;
+        let verifier = Arc::new(DaneServerCertVerifier::new(webpki, tls));
+        state
+            .tls_verifiers
+            .insert(tls_key.to_owned(), Arc::clone(&verifier));
+        Ok(verifier)
+    }
+
+    fn resumption_for(
+        &self,
+        tls_key: &str,
+        alpn_protocols: &[Vec<u8>],
+    ) -> Result<Resumption, TransportError> {
+        let key = format!("{tls_key}|alpn={}", alpn_key(alpn_protocols));
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| TransportError::Tls("transport state lock is poisoned".to_owned()))?;
+        Ok(state
+            .tls_resumption
+            .entry(key)
+            .or_insert_with(|| Resumption::in_memory_sessions(256))
+            .clone())
+    }
+
+    fn http11_pool_key(&self, request: &OriginRequest) -> Http11PoolKey {
+        Http11PoolKey {
+            scheme: request.scheme.to_ascii_lowercase(),
+            host: request.host.to_ascii_lowercase(),
+            connect_host: request
+                .connect_host
+                .as_deref()
+                .unwrap_or(&request.host)
+                .to_ascii_lowercase(),
+            port: request.port,
+            tls_key: tls_validation_key(&request.tls),
+        }
+    }
+
+    fn take_http11_connection(&self, key: &Http11PoolKey) -> Option<PooledHttp11Connection> {
+        self.state
+            .lock()
+            .ok()?
+            .http11_pool
+            .get_mut(key)
+            .and_then(VecDeque::pop_front)
+    }
+
+    fn put_http11_connection(&self, key: Http11PoolKey, connection: PooledHttp11Connection) {
+        if let Ok(mut state) = self.state.lock() {
+            let pool = state.http11_pool.entry(key).or_default();
+            if pool.len() >= MAX_HTTP11_POOL_PER_ORIGIN {
+                pool.pop_front();
+            }
+            pool.push_back(connection);
+        }
+    }
+
+    fn promoted_request(&self, request: &OriginRequest) -> OriginRequest {
+        if !request.scheme.eq_ignore_ascii_case("https")
+            || request.protocol == OriginProtocol::Http3
+        {
+            return request.clone();
+        }
+        let key = AltSvcKey {
+            scheme: "https".to_owned(),
+            host: request.host.to_ascii_lowercase(),
+            port: request.port,
+        };
+        let Some(endpoint) = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.alt_svc.get(&key).cloned())
+        else {
+            return request.clone();
+        };
+        if endpoint.expires_at <= Instant::now() || endpoint.port != request.port {
+            return request.clone();
+        }
+        let mut promoted = request.clone();
+        promoted.protocol = endpoint.protocol;
+        promoted
+    }
+
+    fn record_alt_svc(&self, request: &OriginRequest, headers: &[(String, String)]) {
+        if !request.scheme.eq_ignore_ascii_case("https") {
+            return;
+        }
+        let key = AltSvcKey {
+            scheme: "https".to_owned(),
+            host: request.host.to_ascii_lowercase(),
+            port: request.port,
+        };
+        let values = headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("alt-svc"))
+            .map(|(_, value)| value.as_str())
+            .collect::<Vec<_>>();
+        if values.is_empty() {
+            return;
+        }
+        if values
+            .iter()
+            .any(|value| value.trim().eq_ignore_ascii_case("clear"))
+        {
+            if let Ok(mut state) = self.state.lock() {
+                state.alt_svc.remove(&key);
+            }
+            return;
+        }
+        let Some(endpoint) = selected_alt_svc_endpoint(&values, request.port) else {
+            return;
+        };
+        if let Ok(mut state) = self.state.lock() {
+            state.alt_svc.insert(key, endpoint);
+        }
+    }
+
+    fn send_plain_http11(
+        &self,
+        stream: &mut TcpStream,
+        request: &OriginRequest,
+        body: &mut dyn Write,
+    ) -> Result<(OriginResponseHead, bool), TransportError> {
+        let request_bytes = build_http_request(request, true)?;
+        stream.write_all(&request_bytes).map_err(io_error)?;
+        stream.flush().map_err(io_error)?;
+        let (head, reusable) =
+            parse_http_response_to_writer_reusable(stream, self.limits, &request.method, body)?;
+        self.record_alt_svc(request, &head.headers);
+        Ok((head, reusable))
+    }
+
+    fn send_tls_http11(
+        &self,
+        stream: &mut StreamOwned<ClientConnection, TcpStream>,
+        request: &OriginRequest,
+        body: &mut dyn Write,
+    ) -> Result<(OriginResponseHead, bool), TransportError> {
+        let request_bytes = build_http_request(request, true)?;
+        stream.write_all(&request_bytes).map_err(io_error)?;
+        stream.flush().map_err(io_error)?;
+        let (head, reusable) =
+            parse_http_response_to_writer_reusable(stream, self.limits, &request.method, body)?;
+        self.record_alt_svc(request, &head.headers);
+        Ok((head, reusable))
+    }
+
+    fn send_http11_upgrade(
+        &self,
+        stream: &mut impl ReadWrite,
+        request: &OriginRequest,
+    ) -> Result<Vec<u8>, TransportError> {
+        let request_bytes = build_http_upgrade_request(request)?;
+        stream.write_all(&request_bytes).map_err(io_error)?;
+        stream.flush().map_err(io_error)?;
+        let response_head =
+            read_header_bytes_including_end(stream, self.limits.max_response_header_bytes)?;
+        validate_upgrade_response_head(&response_head)?;
+        Ok(response_head)
     }
 }
 
@@ -638,17 +932,22 @@ impl OriginTransport for FailClosedTransport {
 
 impl OriginTransport for TcpHttpTransport {
     fn fetch(&self, request: &OriginRequest) -> Result<OriginResponse, TransportError> {
+        let request = self.promoted_request(request);
         match (
             request.scheme.to_ascii_lowercase().as_str(),
             request.protocol,
         ) {
-            ("http", OriginProtocol::Http11) => self.fetch_http11(request),
-            ("https", OriginProtocol::Http11) => self.fetch_https_http11(request),
-            ("https", OriginProtocol::Http2) => self.fetch_https_http2(request),
-            ("https", OriginProtocol::Http3) => self.fetch_https_http3(request),
+            ("http", OriginProtocol::Http11) => self.fetch_http11(&request),
+            ("https", OriginProtocol::Http11) => self.fetch_https_http11(&request),
+            ("https", OriginProtocol::Http2) => self.fetch_https_http2(&request),
+            ("https", OriginProtocol::Http3) => self.fetch_https_http3(&request),
             ("http", _) => Err(TransportError::UnsupportedTransport),
             _ => Err(TransportError::UnsupportedScheme),
         }
+    }
+
+    fn open_tunnel(&self, request: &OriginRequest) -> Result<OriginTunnel, TransportError> {
+        self.open_http11_tunnel(request)
     }
 
     fn fetch_to_writer(
@@ -656,14 +955,15 @@ impl OriginTransport for TcpHttpTransport {
         request: &OriginRequest,
         body: &mut dyn Write,
     ) -> Result<OriginResponseHead, TransportError> {
+        let request = self.promoted_request(request);
         match (
             request.scheme.to_ascii_lowercase().as_str(),
             request.protocol,
         ) {
-            ("http", OriginProtocol::Http11) => self.fetch_http11_to_writer(request, body),
-            ("https", OriginProtocol::Http11) => self.fetch_https_http11_to_writer(request, body),
-            ("https", OriginProtocol::Http2) => self.fetch_https_http2_to_writer(request, body),
-            ("https", OriginProtocol::Http3) => self.fetch_https_http3_to_writer(request, body),
+            ("http", OriginProtocol::Http11) => self.fetch_http11_to_writer(&request, body),
+            ("https", OriginProtocol::Http11) => self.fetch_https_http11_to_writer(&request, body),
+            ("https", OriginProtocol::Http2) => self.fetch_https_http2_to_writer(&request, body),
+            ("https", OriginProtocol::Http3) => self.fetch_https_http3_to_writer(&request, body),
             ("http", _) => Err(TransportError::UnsupportedTransport),
             _ => Err(TransportError::UnsupportedScheme),
         }
@@ -674,8 +974,83 @@ impl OriginTransport for TcpHttpTransport {
 struct DaneServerCertVerifier {
     webpki: Arc<WebPkiServerVerifier>,
     tls: TlsValidation,
-    decision: Arc<Mutex<Option<DaneDecision>>>,
-    inspection: Arc<Mutex<Option<TlsCertificateInspection>>>,
+    handshakes: Mutex<HashMap<ThreadId, HandshakeCapture>>,
+    last_success: Mutex<Option<HandshakeCapture>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct HandshakeCapture {
+    decision: Option<DaneDecision>,
+    inspection: Option<TlsCertificateInspection>,
+}
+
+impl DaneServerCertVerifier {
+    fn new(webpki: Arc<WebPkiServerVerifier>, tls: TlsValidation) -> Self {
+        Self {
+            webpki,
+            tls,
+            handshakes: Mutex::new(HashMap::new()),
+            last_success: Mutex::new(None),
+        }
+    }
+
+    fn begin_handshake(&self) {
+        if let Ok(mut handshakes) = self.handshakes.lock() {
+            handshakes.insert(std::thread::current().id(), HandshakeCapture::default());
+        }
+    }
+
+    fn finish_handshake(
+        &self,
+    ) -> Result<(DaneDecision, Option<TlsCertificateInspection>), TransportError> {
+        let capture = self
+            .handshakes
+            .lock()
+            .map_err(|_| TransportError::Tls("TLS handshake lock is poisoned".to_owned()))?
+            .remove(&std::thread::current().id());
+        if let Some(capture) = capture
+            && let Some(decision) = capture.decision
+        {
+            return Ok((decision, capture.inspection));
+        }
+
+        let cached = self
+            .last_success
+            .lock()
+            .map_err(|_| TransportError::Tls("TLS handshake cache lock is poisoned".to_owned()))?
+            .clone()
+            .ok_or_else(|| {
+                TransportError::Tls("TLS certificate policy was not evaluated".to_owned())
+            })?;
+        Ok((
+            cached.decision.ok_or_else(|| {
+                TransportError::Tls("TLS certificate policy was not evaluated".to_owned())
+            })?,
+            cached.inspection,
+        ))
+    }
+
+    fn store_capture(
+        &self,
+        decision: DaneDecision,
+        inspection: TlsCertificateInspection,
+    ) -> Result<(), RustlsError> {
+        let capture = HandshakeCapture {
+            decision: Some(decision),
+            inspection: Some(inspection),
+        };
+        let mut handshakes = self
+            .handshakes
+            .lock()
+            .map_err(|_| RustlsError::General("TLS handshake lock is poisoned".to_owned()))?;
+        handshakes.insert(std::thread::current().id(), capture.clone());
+        let mut last_success = self
+            .last_success
+            .lock()
+            .map_err(|_| RustlsError::General("TLS handshake cache lock is poisoned".to_owned()))?;
+        *last_success = Some(capture);
+        Ok(())
+    }
 }
 
 impl ServerCertVerifier for DaneServerCertVerifier {
@@ -717,18 +1092,9 @@ impl ServerCertVerifier for DaneServerCertVerifier {
                 "DANE certificate association did not match".to_owned(),
             )),
             Ok(decision) => {
-                let mut stored_decision = self.decision.lock().map_err(|_| {
-                    RustlsError::General("TLS decision lock is poisoned".to_owned())
-                })?;
-                *stored_decision = Some(decision);
-                let mut stored_inspection = self.inspection.lock().map_err(|_| {
-                    RustlsError::General("TLS inspection lock is poisoned".to_owned())
-                })?;
-                *stored_inspection = Some(tls_certificate_inspection(
-                    end_entity,
-                    intermediates,
-                    webpki_status,
-                )?);
+                let inspection =
+                    tls_certificate_inspection(end_entity, intermediates, webpki_status)?;
+                self.store_capture(decision, inspection)?;
                 Ok(ServerCertVerified::assertion())
             }
             Err(DaneError::WebPkiFailed) => webpki_result,
@@ -917,6 +1283,33 @@ fn validate_request(
     request: &OriginRequest,
     limits: TransportLimits,
 ) -> Result<(), TransportError> {
+    validate_request_common(request, limits)?;
+
+    if is_protocol_upgrade(&request.headers) {
+        return Err(TransportError::UnsupportedUpgrade);
+    }
+
+    Ok(())
+}
+
+fn validate_tunnel_request(
+    request: &OriginRequest,
+    limits: TransportLimits,
+) -> Result<(), TransportError> {
+    validate_request_common(request, limits)?;
+    if !is_protocol_upgrade(&request.headers) {
+        return Err(TransportError::UnsupportedUpgrade);
+    }
+    if !request.body.is_empty() {
+        return Err(TransportError::InvalidRequest);
+    }
+    Ok(())
+}
+
+fn validate_request_common(
+    request: &OriginRequest,
+    limits: TransportLimits,
+) -> Result<(), TransportError> {
     if !is_http_token(&request.method)
         || !is_valid_host(&request.host)
         || request.port == 0
@@ -939,10 +1332,6 @@ fn validate_request(
         return Err(TransportError::RequestTooLarge);
     }
 
-    if is_protocol_upgrade(&request.headers) {
-        return Err(TransportError::UnsupportedUpgrade);
-    }
-
     for (name, value) in &request.headers {
         if !is_http_token(name) || value.bytes().any(|byte| byte == b'\r' || byte == b'\n') {
             return Err(TransportError::InvalidRequest);
@@ -952,7 +1341,18 @@ fn validate_request(
     Ok(())
 }
 
-fn build_http_request(request: &OriginRequest) -> Result<Vec<u8>, TransportError> {
+fn tunnel_origin_scheme(scheme: &str) -> Result<String, TransportError> {
+    match scheme.to_ascii_lowercase().as_str() {
+        "http" | "ws" => Ok("http".to_owned()),
+        "https" | "wss" => Ok("https".to_owned()),
+        _ => Err(TransportError::UnsupportedScheme),
+    }
+}
+
+fn build_http_request(
+    request: &OriginRequest,
+    keep_alive: bool,
+) -> Result<Vec<u8>, TransportError> {
     let mut out = Vec::new();
     write!(
         out,
@@ -973,18 +1373,57 @@ fn build_http_request(request: &OriginRequest) -> Result<Vec<u8>, TransportError
         write!(out, "{name}: {value}\r\n").map_err(io_error)?;
     }
 
+    let connection = if keep_alive { "keep-alive" } else { "close" };
     if request.body.is_empty() {
-        out.extend(b"Connection: close\r\n\r\n");
+        write!(out, "Connection: {connection}\r\n\r\n").map_err(io_error)?;
     } else {
         write!(
             out,
-            "Content-Length: {}\r\nConnection: close\r\n\r\n",
+            "Content-Length: {}\r\nConnection: {connection}\r\n\r\n",
             request.body.len(),
         )
         .map_err(io_error)?;
         out.extend(&request.body);
     }
 
+    Ok(out)
+}
+
+fn build_http_upgrade_request(request: &OriginRequest) -> Result<Vec<u8>, TransportError> {
+    let mut out = Vec::new();
+    write!(
+        out,
+        "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: hns-browser/0.2.2\r\nAccept: */*\r\n",
+        request.method.to_ascii_uppercase(),
+        request.path_and_query,
+        host_header(&request.host, request.port, &request.scheme),
+    )
+    .map_err(io_error)?;
+
+    let mut has_connection_upgrade = false;
+    let mut has_upgrade = false;
+    for (name, value) in &request.headers {
+        if name.eq_ignore_ascii_case("host")
+            || name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("proxy-connection")
+        {
+            continue;
+        }
+        if name.eq_ignore_ascii_case("connection") && has_header_token(value, "upgrade") {
+            has_connection_upgrade = true;
+        }
+        if name.eq_ignore_ascii_case("upgrade") {
+            has_upgrade = true;
+        }
+        write!(out, "{name}: {value}\r\n").map_err(io_error)?;
+    }
+    if !has_connection_upgrade {
+        out.extend(b"Connection: Upgrade\r\n");
+    }
+    if !has_upgrade {
+        out.extend(b"Upgrade: websocket\r\n");
+    }
+    out.extend(b"\r\n");
     Ok(out)
 }
 
@@ -1007,28 +1446,12 @@ fn host_header(host: &str, port: u16, scheme: &str) -> String {
     }
 }
 
-fn parse_http_response(
-    stream: &mut impl Read,
-    limits: TransportLimits,
-    request_method: &str,
-) -> Result<OriginResponse, TransportError> {
-    let mut body = Vec::new();
-    let head = parse_http_response_to_writer(stream, limits, request_method, &mut body)?;
-    Ok(OriginResponse {
-        status: head.status,
-        headers: head.headers,
-        body,
-        dane_decision: head.dane_decision,
-        tls_inspection: head.tls_inspection,
-    })
-}
-
-fn parse_http_response_to_writer(
+fn parse_http_response_to_writer_reusable(
     stream: &mut impl Read,
     limits: TransportLimits,
     request_method: &str,
     body: &mut dyn Write,
-) -> Result<OriginResponseHead, TransportError> {
+) -> Result<(OriginResponseHead, bool), TransportError> {
     let header_bytes = read_header_bytes(stream, limits.max_response_header_bytes)?;
     let header_text =
         std::str::from_utf8(&header_bytes).map_err(|_| TransportError::MalformedResponse)?;
@@ -1060,7 +1483,8 @@ fn parse_http_response_to_writer(
         headers.push((name, value));
     }
 
-    let body_len = if response_has_no_body(request_method, status) {
+    let mut self_delimited = response_has_no_body(request_method, status);
+    let body_len = if self_delimited {
         0
     } else if let Some(transfer_encoding) = transfer_encoding(&headers)? {
         if content_length(&headers)?.is_some() {
@@ -1069,20 +1493,27 @@ fn parse_http_response_to_writer(
         if transfer_encoding != [TransferCoding::Chunked] {
             return Err(TransportError::UnsupportedTransferEncoding);
         }
+        self_delimited = true;
         read_chunked_body_to_writer(stream, limits.max_response_body_bytes, body)?
     } else if let Some(length) = content_length(&headers)? {
+        self_delimited = true;
         read_fixed_body_to_writer(stream, length, limits.max_response_body_bytes, body)?
     } else {
         read_until_eof_to_writer(stream, limits.max_response_body_bytes, body)?
     };
+    let reusable =
+        version.eq_ignore_ascii_case("HTTP/1.1") && self_delimited && !connection_close(&headers);
 
-    Ok(OriginResponseHead {
-        status,
-        headers,
-        body_len,
-        dane_decision: DaneDecision::NoTlsa,
-        tls_inspection: None,
-    })
+    Ok((
+        OriginResponseHead {
+            status,
+            headers,
+            body_len,
+            dane_decision: DaneDecision::NoTlsa,
+            tls_inspection: None,
+        },
+        reusable,
+    ))
 }
 
 fn response_has_no_body(request_method: &str, status: u16) -> bool {
@@ -1109,6 +1540,65 @@ fn read_header_bytes(stream: &mut impl Read, limit: usize) -> Result<Vec<u8>, Tr
     }
 
     Err(TransportError::ResponseTooLarge)
+}
+
+fn read_header_bytes_including_end(
+    stream: &mut impl Read,
+    limit: usize,
+) -> Result<Vec<u8>, TransportError> {
+    let mut out = Vec::new();
+    let mut byte = [0u8; 1];
+
+    while out.len() < limit {
+        let read = stream.read(&mut byte).map_err(io_error)?;
+        if read == 0 {
+            return Err(TransportError::MalformedResponse);
+        }
+        out.push(byte[0]);
+        if out.ends_with(b"\r\n\r\n") {
+            return Ok(out);
+        }
+    }
+
+    Err(TransportError::ResponseTooLarge)
+}
+
+fn validate_upgrade_response_head(response_head: &[u8]) -> Result<(), TransportError> {
+    let header_text =
+        std::str::from_utf8(response_head).map_err(|_| TransportError::MalformedResponse)?;
+    let header_text = header_text
+        .strip_suffix("\r\n\r\n")
+        .ok_or(TransportError::MalformedResponse)?;
+    let mut lines = header_text.split("\r\n");
+    let status_line = lines.next().ok_or(TransportError::MalformedResponse)?;
+    let mut status_parts = status_line.splitn(3, ' ');
+    let version = status_parts
+        .next()
+        .ok_or(TransportError::MalformedResponse)?;
+    let status = status_parts
+        .next()
+        .ok_or(TransportError::MalformedResponse)?
+        .parse::<u16>()
+        .map_err(|_| TransportError::MalformedResponse)?;
+    if !version.starts_with("HTTP/") || status != 101 {
+        return Err(TransportError::MalformedResponse);
+    }
+
+    let mut headers = Vec::new();
+    for line in lines.filter(|line| !line.is_empty()) {
+        let (name, value) = line
+            .split_once(':')
+            .ok_or(TransportError::MalformedResponse)?;
+        headers.push((name.trim().to_owned(), value.trim().to_owned()));
+    }
+    if !headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("connection") && has_header_token(value, "upgrade")
+    }) || !headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("upgrade") && value.eq_ignore_ascii_case("websocket")
+    }) {
+        return Err(TransportError::MalformedResponse);
+    }
+    Ok(())
 }
 
 fn read_fixed_body_to_writer(
@@ -1241,6 +1731,12 @@ fn content_length(headers: &[(String, String)]) -> Result<Option<usize>, Transpo
     Ok(value)
 }
 
+fn connection_close(headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("connection") && has_header_token(value, "close")
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TransferCoding {
     Chunked,
@@ -1300,6 +1796,115 @@ fn has_header_token(value: &str, expected: &str) -> bool {
         .any(|token| token.eq_ignore_ascii_case(expected))
 }
 
+fn selected_alt_svc_endpoint(values: &[&str], request_port: u16) -> Option<AltSvcEndpoint> {
+    let now = Instant::now();
+    let mut best = None;
+    for value in values {
+        for alternative in value.split(',') {
+            let alternative = alternative.trim();
+            let (protocol, rest) = alternative.split_once('=')?;
+            let protocol = protocol.trim().to_ascii_lowercase();
+            let protocol = if protocol == "h3" || protocol.starts_with("h3-") {
+                OriginProtocol::Http3
+            } else if protocol == "h2" {
+                OriginProtocol::Http2
+            } else {
+                continue;
+            };
+            let authority = rest.trim_start();
+            if !authority.starts_with('"') {
+                continue;
+            }
+            let Some(end_quote) = authority[1..].find('"') else {
+                continue;
+            };
+            let authority_value = &authority[1..1 + end_quote];
+            let Some(port) = alt_svc_authority_port(authority_value, request_port) else {
+                continue;
+            };
+            if port != request_port {
+                continue;
+            }
+            let params = &authority[1 + end_quote + 1..];
+            let max_age = alt_svc_max_age(params).unwrap_or(MAX_ALT_SVC_AGE_SECS);
+            if max_age == 0 {
+                continue;
+            }
+            let endpoint = AltSvcEndpoint {
+                protocol,
+                port,
+                expires_at: now + Duration::from_secs(max_age.min(MAX_ALT_SVC_AGE_SECS)),
+            };
+            if best.as_ref().is_none_or(|current: &AltSvcEndpoint| {
+                protocol_rank(endpoint.protocol) > protocol_rank(current.protocol)
+            }) {
+                best = Some(endpoint);
+            }
+        }
+    }
+    best
+}
+
+fn alt_svc_authority_port(authority: &str, default_port: u16) -> Option<u16> {
+    if authority.is_empty() {
+        return Some(default_port);
+    }
+    if let Some(port_text) = authority.strip_prefix(':') {
+        return port_text.parse::<u16>().ok();
+    }
+    let (_, port_text) = authority.rsplit_once(':')?;
+    port_text.parse::<u16>().ok()
+}
+
+fn alt_svc_max_age(params: &str) -> Option<u64> {
+    params.split(';').find_map(|param| {
+        let (name, value) = param.trim().split_once('=')?;
+        name.trim()
+            .eq_ignore_ascii_case("ma")
+            .then(|| value.trim().trim_matches('"').parse::<u64>().ok())
+            .flatten()
+    })
+}
+
+fn protocol_rank(protocol: OriginProtocol) -> u8 {
+    match protocol {
+        OriginProtocol::Http3 => 3,
+        OriginProtocol::Http2 => 2,
+        OriginProtocol::Http11 => 1,
+    }
+}
+
+fn tls_validation_key(tls: &TlsValidation) -> String {
+    let mut out = format!(
+        "mode={:?};secure={};records={}",
+        tls.mode,
+        tls.dnssec_secure,
+        tls.tlsa_records.len(),
+    );
+    for record in &tls.tlsa_records {
+        out.push_str(&format!(
+            ";{:?}:{:?}:{:?}:",
+            record.usage, record.selector, record.matching,
+        ));
+        append_hash_hex(&mut out, &record.association_data);
+    }
+    out
+}
+
+fn append_hash_hex(out: &mut String, bytes: &[u8]) {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    out.push_str(&format!("{:016x}", hasher.finish()));
+}
+
+fn alpn_key(alpn_protocols: &[Vec<u8>]) -> String {
+    alpn_protocols
+        .iter()
+        .map(|value| String::from_utf8_lossy(value).into_owned())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn is_http_token(value: &str) -> bool {
     !value.is_empty()
         && value.bytes().all(|byte| {
@@ -1356,25 +1961,6 @@ fn quic_error(error: impl std::fmt::Display) -> TransportError {
     TransportError::Quic(error.to_string())
 }
 
-fn tls_decision(
-    decision: Arc<Mutex<Option<DaneDecision>>>,
-) -> Result<DaneDecision, TransportError> {
-    decision
-        .lock()
-        .map_err(|_| TransportError::Tls("TLS decision lock is poisoned".to_owned()))?
-        .clone()
-        .ok_or_else(|| TransportError::Tls("TLS certificate policy was not evaluated".to_owned()))
-}
-
-fn tls_inspection(
-    inspection: Arc<Mutex<Option<TlsCertificateInspection>>>,
-) -> Result<Option<TlsCertificateInspection>, TransportError> {
-    inspection
-        .lock()
-        .map_err(|_| TransportError::Tls("TLS inspection lock is poisoned".to_owned()))
-        .map(|inspection| inspection.clone())
-}
-
 fn tls_certificate_inspection(
     end_entity: &CertificateDer<'_>,
     intermediates: &[CertificateDer<'_>],
@@ -1426,7 +2012,7 @@ mod tests {
         let raw_request = server.request();
         assert!(raw_request.starts_with("GET /path?q=1 HTTP/1.1\r\n"));
         assert!(raw_request.contains("Host: example.com"));
-        assert!(raw_request.contains("Connection: close"));
+        assert!(raw_request.contains("Connection: keep-alive"));
     }
 
     #[test]
@@ -1479,6 +2065,84 @@ mod tests {
             ]
         );
         assert_eq!(streamed, body);
+    }
+
+    #[test]
+    fn reuses_http11_origin_connection() {
+        let server = PersistentHttp11Server::start(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo".to_vec(),
+        ]);
+        let transport = TcpHttpTransport::new(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            TransportLimits::default(),
+        );
+
+        let first = transport.fetch(&request(server.address)).unwrap();
+        let second = transport.fetch(&request(server.address)).unwrap();
+
+        assert_eq!(first.body, b"one");
+        assert_eq!(second.body, b"two");
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("Connection: keep-alive\r\n"));
+        assert!(requests[1].contains("Connection: keep-alive\r\n"));
+    }
+
+    #[test]
+    fn promotes_https_same_port_alt_svc_to_http2() {
+        let server = TlsTestServer::start_alt_svc_h2();
+        let transport = TcpHttpTransport::new(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            TransportLimits::default(),
+        );
+        let mut request = request(server.address);
+        request.scheme = "https".to_owned();
+        request.tls = TlsValidation::hns_strict(true, vec![tlsa_spki_exact(&server.cert_der)]);
+
+        let first = transport.fetch(&request).unwrap();
+        let second = transport.fetch(&request).unwrap();
+
+        assert_eq!(first.body, b"h1");
+        assert_eq!(second.body, b"h2");
+        let requests = server.requests(2);
+        assert!(requests[0].starts_with("h1 GET /path?q=1 HTTP/1.1"));
+        assert!(requests[1].starts_with("h2 GET https://example.com:"));
+        assert!(requests[1].ends_with("/path?q=1"));
+    }
+
+    #[test]
+    fn opens_http11_upgrade_tunnel_and_preserves_stream_bytes() {
+        let server = UpgradeTestServer::start();
+        let transport = TcpHttpTransport::new(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            TransportLimits::default(),
+        );
+        let mut request = request(server.address);
+        request.headers.extend([
+            ("Connection".to_owned(), "Upgrade".to_owned()),
+            ("Upgrade".to_owned(), "websocket".to_owned()),
+            (
+                "Sec-WebSocket-Key".to_owned(),
+                "dGhlIHNhbXBsZSBub25jZQ==".to_owned(),
+            ),
+            ("Sec-WebSocket-Version".to_owned(), "13".to_owned()),
+        ]);
+
+        let mut tunnel = transport.open_tunnel(&request).unwrap();
+        tunnel.stream.write_all(b"ping").unwrap();
+        tunnel.stream.flush().unwrap();
+        let mut echoed = [0u8; 4];
+        tunnel.stream.read_exact(&mut echoed).unwrap();
+
+        assert!(tunnel.response_head.starts_with(b"HTTP/1.1 101 "));
+        assert_eq!(&echoed, b"ping");
+        let raw_request = server.request();
+        assert!(raw_request.contains("Connection: Upgrade\r\n"));
+        assert!(raw_request.contains("Upgrade: websocket\r\n"));
     }
 
     #[test]
@@ -1539,7 +2203,7 @@ mod tests {
             .headers
             .push(("Content-Length".to_owned(), "999".to_owned()));
 
-        let bytes = build_http_request(&request).unwrap();
+        let bytes = build_http_request(&request, false).unwrap();
         let text = String::from_utf8(bytes).unwrap();
 
         assert_eq!(text.matches("Content-Length:").count(), 1);
@@ -1558,7 +2222,7 @@ mod tests {
             .headers
             .push(("If-Range".to_owned(), "\"abc\"".to_owned()));
 
-        let text = String::from_utf8(build_http_request(&request).unwrap()).unwrap();
+        let text = String::from_utf8(build_http_request(&request, false).unwrap()).unwrap();
 
         assert!(text.contains("Range: bytes=10-19\r\n"));
         assert!(text.contains("If-Range: \"abc\"\r\n"));
@@ -1863,6 +2527,107 @@ mod tests {
         }
     }
 
+    struct PersistentHttp11Server {
+        address: SocketAddr,
+        request_rx: mpsc::Receiver<String>,
+        request_count: usize,
+    }
+
+    impl PersistentHttp11Server {
+        fn start(responses: Vec<Vec<u8>>) -> Self {
+            let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+            let address = listener.local_addr().unwrap();
+            let request_count = responses.len();
+            let (request_tx, request_rx) = mpsc::channel();
+
+            thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                for response in responses {
+                    let request = read_test_http_head(&mut stream);
+                    request_tx
+                        .send(String::from_utf8_lossy(&request).into_owned())
+                        .unwrap();
+                    stream.write_all(&response).unwrap();
+                    stream.flush().unwrap();
+                }
+            });
+
+            Self {
+                address,
+                request_rx,
+                request_count,
+            }
+        }
+
+        fn requests(self) -> Vec<String> {
+            (0..self.request_count)
+                .map(|_| {
+                    self.request_rx
+                        .recv_timeout(Duration::from_secs(1))
+                        .unwrap()
+                })
+                .collect()
+        }
+    }
+
+    struct UpgradeTestServer {
+        address: SocketAddr,
+        request_rx: mpsc::Receiver<String>,
+    }
+
+    impl UpgradeTestServer {
+        fn start() -> Self {
+            let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+            let address = listener.local_addr().unwrap();
+            let (request_tx, request_rx) = mpsc::channel();
+
+            thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_test_http_head(&mut stream);
+                request_tx
+                    .send(String::from_utf8_lossy(&request).into_owned())
+                    .unwrap();
+                stream
+                    .write_all(
+                        b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+                    )
+                    .unwrap();
+                stream.flush().unwrap();
+                let mut payload = [0u8; 4];
+                stream.read_exact(&mut payload).unwrap();
+                stream.write_all(&payload).unwrap();
+                stream.flush().unwrap();
+            });
+
+            Self {
+                address,
+                request_rx,
+            }
+        }
+
+        fn request(self) -> String {
+            self.request_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+        }
+    }
+
+    fn read_test_http_head(stream: &mut impl Read) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 1024];
+        loop {
+            let read = stream.read(&mut buffer).unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend(&buffer[..read]);
+            if request.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        request
+    }
+
     struct TlsTestServer {
         address: SocketAddr,
         cert_der: Vec<u8>,
@@ -2017,6 +2782,86 @@ mod tests {
             }
         }
 
+        fn start_alt_svc_h2() -> Self {
+            let rcgen::CertifiedKey { cert, signing_key } =
+                rcgen::generate_simple_self_signed(vec!["example.com".to_owned()]).unwrap();
+            let cert_der = cert.der().to_vec();
+            let key_der =
+                PrivateKeyDer::from(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
+            let mut config = ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![CertificateDer::from(cert_der.clone())], key_der)
+            .unwrap();
+            config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+            let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+            let address = listener.local_addr().unwrap();
+            let (request_tx, request_rx) = mpsc::channel();
+
+            thread::spawn(move || {
+                let config = Arc::new(config);
+                let (stream, _) = listener.accept().unwrap();
+                let connection = ServerConnection::new(Arc::clone(&config)).unwrap();
+                let mut stream = StreamOwned::new(connection, stream);
+                let request = read_test_http_head(&mut stream);
+                request_tx
+                    .send(format!("h1 {}", String::from_utf8_lossy(&request)))
+                    .unwrap();
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nAlt-Svc: h2=\":{}\"; ma=60\r\nConnection: close\r\n\r\nh1",
+                            address.port()
+                        )
+                        .as_bytes(),
+                    )
+                    .unwrap();
+                stream.flush().unwrap();
+
+                let (stream, _) = listener.accept().unwrap();
+                stream.set_nonblocking(true).unwrap();
+                let acceptor = tokio_rustls::TlsAcceptor::from(config);
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_io()
+                    .enable_time()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async move {
+                    let stream = tokio::net::TcpStream::from_std(stream).unwrap();
+                    let stream = acceptor.accept(stream).await.unwrap();
+                    let mut connection = h2::server::handshake(stream).await.unwrap();
+                    if let Some(request) = connection.accept().await {
+                        let (request, mut respond) = request.unwrap();
+                        request_tx
+                            .send(format!("h2 {} {}", request.method(), request.uri()))
+                            .unwrap();
+                        let response = http::Response::builder()
+                            .status(200)
+                            .header("content-length", "2")
+                            .body(())
+                            .unwrap();
+                        let mut send = respond.send_response(response, false).unwrap();
+                        send.send_data(Bytes::from_static(b"h2"), true).unwrap();
+                        connection.graceful_shutdown();
+                        let _ =
+                            tokio::time::timeout(Duration::from_millis(100), connection.accept())
+                                .await;
+                    }
+                });
+            });
+
+            Self {
+                address,
+                cert_der,
+                intermediate_cert_der: None,
+                request_rx,
+            }
+        }
+
         fn start_with_intermediate() -> Self {
             let mut intermediate_params =
                 rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -2115,6 +2960,16 @@ mod tests {
             self.request_rx
                 .recv_timeout(Duration::from_secs(1))
                 .unwrap()
+        }
+
+        fn requests(self, count: usize) -> Vec<String> {
+            (0..count)
+                .map(|_| {
+                    self.request_rx
+                        .recv_timeout(Duration::from_secs(1))
+                        .unwrap()
+                })
+                .collect()
         }
     }
 }
