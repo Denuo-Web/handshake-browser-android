@@ -4,8 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.2.3 - 2026-06-30
+
 ### Security
 
+- Hardened Android WebView startup, optional WebKit feature usage, Service Worker interception, renderer recovery, and non-HTTP(S) navigation handling.
 - Hardened the Android loopback gateway so it refuses broad WebView proxy fallback when host-scoped reverse-bypass support is unavailable.
 - Restricted loopback gateway handling to active HNS host/subdomain scope and rejected non-HNS proxy traffic with fail-closed responses.
 - Removed release stack-trace printing from the loopback accept path and kept diagnostics bounded through the gateway event log.
